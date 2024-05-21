@@ -46,14 +46,16 @@ class MidTrainingWarmupScheduler(_LRScheduler):
         super().step(epoch)
 
 
-BETA_1 = 0.0
+BETA_1 = 0.0 # following https://transformer-circuits.pub/2024/feb-update/index.html
 BETA_2 = 0.999
+L1_COEFF = 5.0
+LR = 0.0003 # following https://arxiv.org/pdf/2404.16014
+BATCH_SIZE = 512 # a somewhat lower batch size because our dataset is very small
 
 
 ################################################################################
 ### vanilla SAEs
 ################################################################################
-@op
 def train_vanilla(
     A: Tensor,
     d_activation: int, 
@@ -63,28 +65,26 @@ def train_vanilla(
     encoder_state_dict: Optional[Dict[str, Tensor]],
     optimizer_state_dict: Optional[Any],
     scheduler_state_dict: Optional[Any],
-    l1_coeff: float = 0.01,
-    lr: float=1e-3,
+    l1_coeff: float = L1_COEFF,
+    lr: float=LR,
     beta1: float=BETA_1,
     beta2: float=BETA_2,
-    batch_size: int = 64,
+    batch_size: int = BATCH_SIZE,
     resample_every: Optional[int] = None,
+    resample_warmup_steps: int = 100, # following https://arxiv.org/pdf/2404.16014 etc. 
     torch_random_seed: int = 42,
-    normalize: bool = False,
     freeze_decoder: bool = False,
-    ): # TODO
+    ): 
     torch.manual_seed(torch_random_seed)
     encoder = VanillaAutoEncoder(d_activation=d_activation, 
                             d_hidden=d_hidden, freeze_decoder=freeze_decoder).cuda()
     encoder.load_state_dict(encoder_state_dict, strict=True)
     optim = torch.optim.Adam(encoder.parameters(), lr=lr, betas=(beta1, beta2))
     optim.load_state_dict(optimizer_state_dict)
-    scheduler = MidTrainingWarmupScheduler(optim, 100)
+    scheduler = MidTrainingWarmupScheduler(optim, resample_warmup_steps)
     scheduler.load_state_dict(scheduler_state_dict)
     pbar = tqdm(range(start_epoch, end_epoch))
     n = A.shape[0]
-    if normalize:
-        A, normalization_scale = normalize_sae_inputs(A)
     metrics = []
     for epoch in pbar:
         perm = torch.randperm(n)
@@ -195,58 +195,120 @@ def train_gated(
     encoder_state_dict: Optional[Dict[str, Tensor]],
     optimizer_state_dict: Optional[Any],
     scheduler_state_dict: Optional[Any],
-    l1_coeff: float = 0.01,
-    lr: float=1e-3,
+    l1_coeff: float = L1_COEFF,
+    lr: float=LR,
     beta1: float=BETA_1,
     beta2: float=BETA_2,
-    batch_size: int = 64,
+    batch_size: int = BATCH_SIZE,
     resample_every: Optional[int] = None,
+    resample_warmup_steps: int = 100, # following https://arxiv.org/pdf/2404.16014 etc. 
     torch_random_seed: int = 42,
-    normalize: bool = False,
-    ): # TODO
+    ):
+    """
+    Training following the Gated SAE architecture from https://arxiv.org/pdf/2404.16014
+    """ 
     torch.manual_seed(torch_random_seed)
-    encoder = GatedAutoEncoder(d_activation=d_activation, 
-                            d_hidden=d_hidden).cuda()
+    encoder = GatedAutoEncoder(d_activation=d_activation, d_hidden=d_hidden).cuda()
     encoder.load_state_dict(encoder_state_dict, strict=True)
     optim = torch.optim.Adam(encoder.parameters(), lr=lr, betas=(beta1, beta2))
     optim.load_state_dict(optimizer_state_dict)
-    scheduler = MidTrainingWarmupScheduler(optim, 100)
+    scheduler = MidTrainingWarmupScheduler(optim, resample_warmup_steps)
     scheduler.load_state_dict(scheduler_state_dict)
     pbar = tqdm(range(start_epoch, end_epoch))
     n = A.shape[0]
-    if normalize:
-        A, normalization_scale = normalize_sae_inputs(A)
     metrics = []
     for epoch in pbar:
         perm = torch.randperm(n)
         epoch_metrics = {
             "l2_loss": 0,
             "l1_loss": 0,
+            "aux_loss": 0,
             "l0_loss": 0,
+            "total_loss": 0,
+            "epoch": epoch,
         }
         feature_counts = 0
         for i in range(0, n, batch_size):
             A_batch = A[perm[i:i+batch_size]]
             optim.zero_grad()
-            A_hat, acts, l2_loss, l1_loss = encoder(A_batch)
-            loss = l2_loss + l1_loss * l1_coeff
+            f_tilde, pi_gate, L_sparsity = encoder.encode(A_batch)
+            A_hat, L_reconstruct, L_aux = encoder.decode(f_tilde, pi_gate, A_batch)
+            loss = L_reconstruct + L_sparsity * l1_coeff + L_aux # important part
             loss.backward()
             encoder.make_decoder_weights_and_grad_unit_norm()
             optim.step()
             scheduler.step()
             actual_batch_size = A_batch.shape[0]
-            epoch_metrics["l2_loss"] += l2_loss.item() * actual_batch_size
-            epoch_metrics["l1_loss"] += l1_loss.item() * actual_batch_size
-            epoch_metrics["l0_loss"] += (acts > 0).sum(dim=-1).float().mean().item() * actual_batch_size
-            feature_counts += (acts > 0).float().sum(dim=0)
+            epoch_metrics["l2_loss"] += L_reconstruct.item() * actual_batch_size
+            epoch_metrics["l1_loss"] += L_sparsity.item() * actual_batch_size
+            epoch_metrics["l0_loss"] += (pi_gate > 0).sum(dim=-1).float().mean().item() * actual_batch_size
+            epoch_metrics["aux_loss"] += L_aux.item() * actual_batch_size
+            epoch_metrics["total_loss"] += loss.item() * actual_batch_size
+            feature_counts += (pi_gate > 0).float().sum(dim=0)
         epoch_metrics["l2_loss"] /= n
         epoch_metrics["l1_loss"] /= n
         epoch_metrics["l0_loss"] /= n
+        epoch_metrics["aux_loss"] /= n
+        epoch_metrics["total_loss"] /= n
         metrics.append(epoch_metrics)
         if epoch != 0 and resample_every is not None and epoch % resample_every == 0:
             dead_indices = (feature_counts < 1).nonzero().squeeze()
             if len(dead_indices) > 0:
-                resample_vanilla(encoder, dead_indices, A, l1_coeff, optim)
+                resample_gated(encoder, dead_indices, A, l1_coeff, optim)
                 scheduler.start_warmup()
         pbar.set_description(f"l2_loss: {epoch_metrics['l2_loss']:.4f}, l1_loss: {epoch_metrics['l1_loss']:.4f}, l0_loss: {epoch_metrics['l0_loss']:.4f}")
-    return encoder.state_dict(), optim.state_dict(), scheduler.state_dict(), metrics###############################################################################
+    return encoder.state_dict(), optim.state_dict(), scheduler.state_dict(), metrics
+
+
+@torch.no_grad()
+def resample_gated(encoder: GatedAutoEncoder, dead_indices: Tensor, A: Tensor, l1_coeff: float,
+                   optimizer: torch.optim.Adam, W_enc_reinit_scale: float = 0.2):
+    """
+    Re-initializes the weights of the encoder for the given indices, following
+    the re-initialization strategy from Anthropic
+    """
+    ### collect losses of the encoder on the activations
+    batch_size = 64
+    n = A.shape[0]
+    L_reconstruct_parts, L_sparsity_parts, L_aux_parts = [], [], []
+    for i in range(0, n, batch_size):
+        A_batch = A[i:i+batch_size]
+        f_tilde, pi_gate, L_sparsity = encoder.encode(A_batch)
+        A_hat, L_reconstruct, L_aux = encoder.decode(f_tilde, pi_gate, A_batch)
+        L_reconstruct_parts.append(L_reconstruct)
+        L_sparsity_parts.append(L_sparsity)
+        L_aux_parts.append(L_aux)
+    L_reconstruct = torch.cat(L_reconstruct_parts)
+    L_sparsity = torch.cat(L_sparsity_parts)
+    L_aux = torch.cat(L_aux_parts)
+    total_losses = L_reconstruct + L_sparsity * l1_coeff + L_aux
+    squared_losses = total_losses ** 2
+
+    ### sample indices of examples to use for re-initialization
+    sampling_probabilities = squared_losses / squared_losses.sum()
+    sample_indices = torch.multinomial(
+        sampling_probabilities,
+        len(dead_indices),
+        replacement=True, # in case there are more dead indices than examples
+    )
+
+    ### re-initialize decoder and encoder weights
+    encoder.W_dec.data[dead_indices, :] = A[sample_indices] / A[sample_indices].norm(dim=-1, keepdim=True)
+    encoder.W_gate.data[:, dead_indices] = encoder.W_gate.data[dead_indices, :].T.clone()
+    # ? not specified in the paper, defaulting to 0 (so, factor of 1 after exp)
+    encoder.r_mag.data[dead_indices] = 0.0 
+    # now, figure out the average norm of W_gate over alive neurons
+    alive_indices = torch.ones(encoder.W_gate.shape[1], dtype=torch.bool)
+    alive_indices[dead_indices] = False
+    avg_alive_enc_norm = encoder.W_gate[:, alive_indices].norm(dim=-1).mean()
+    encoder.W_gate.data[:, dead_indices] *= W_enc_reinit_scale * avg_alive_enc_norm
+    encoder.b_gate.data[dead_indices] = 0.0
+    encoder.b_mag.data[dead_indices] = 0.0
+
+    ### reset the optimizer weights for the changed parameters
+    # we must reset only the encoder bias, and the encoder and decoder weights
+    reset_adam_optimizer_params(optimizer, encoder.b_gate, dead_indices)
+    reset_adam_optimizer_params(optimizer, encoder.b_mag, dead_indices)
+    reset_adam_optimizer_params(optimizer, encoder.W_gate, (slice(None), dead_indices))
+    reset_adam_optimizer_params(optimizer, encoder.W_dec, (dead_indices, slice(None)))
+    reset_adam_optimizer_params(optimizer, encoder.r_mag, dead_indices)

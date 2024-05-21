@@ -89,6 +89,7 @@ class GatedAutoEncoder(nn.Module):
         # using the paper's notation
         X_centered = X - self.b_dec
         pi_gate = einsum(self.W_gate, X_centered, 'dim hidden, batch dim -> batch hidden') + self.b_gate
+        # f_gate gives the activation pattern for the hidden layer
         f_gate = (pi_gate > 0).float()
         W_mag = einsum(torch.exp(self.r_mag), self.W_gate, 'hidden, dim hidden -> dim hidden')
         f_mag = einsum(W_mag, X_centered, 'dim hidden, batch dim -> batch hidden') + self.b_mag
