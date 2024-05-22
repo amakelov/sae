@@ -1,3 +1,4 @@
+import os
 import matplotlib.pyplot as plt
 from collections import OrderedDict
 from functools import partial
@@ -39,7 +40,8 @@ from transformer_lens import utils
 from transformer_lens.hook_points import HookPoint
 from fancy_einsum import einsum
 
-from mandala.all import *
+
+from mandala._next.imports import op, sess, MList, MDict
 
 MODEL_ID = 'gpt2small'
 MODELS = {}
@@ -770,6 +772,7 @@ class batched:
             batch_size = kwargs.get("batch_size", None)
             verbose = kwargs.get("verbose", self.verbose)
             if batch_size is None:
+                sess.d()
                 return func(*args, **kwargs)
             bound_args = inspect.signature(func).bind(*args, **kwargs)
             bound_args.apply_defaults()
@@ -851,14 +854,14 @@ def estimate_resid_scales_before(
 @batched(args=['prompts'], n_outputs=1, reducer='cat')
 def run_with_cache(
     prompts: Any, 
-    nodes: List[Node],
+    nodes: MList[Node],
     batch_size: int,
     model_id: str = MODEL_ID,
     verbose: bool = True,
     return_logits: bool = False,
     offload_to_cpu: bool = False,
     clear_cache: bool = False,
-) -> List[Tensor]:
+) -> MList[Tensor]:
     """
     Run the model on the given prompts, and return the activations for the
     given nodes.

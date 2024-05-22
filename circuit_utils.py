@@ -80,7 +80,7 @@ def generate_name_samples(n_samples, names, random_seed: int = 0) -> Any:
     return np.random.choice(names, n_samples, replace=True)
 
 
-@op(version=1)
+@op
 def get_cf_prompts(
     prompts: Any, # List[Prompt],
     features: Tuple[str, ...],
@@ -434,7 +434,7 @@ def get_edited_act(
     return val
 
 
-@op(version=1)
+@op
 def get_cf_edited_act(
     val: Tensor,
     features_to_edit: Tuple[str,...],
@@ -489,7 +489,7 @@ def get_forced_hook(
         return activation
     return (node.activation_name, hook_fn)
 
-@op(version=2)
+@op
 def run_activation_patch(
     base_prompts: Any, # List[Prompt],
     cf_prompts: Any, # List[Prompt],

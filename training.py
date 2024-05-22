@@ -1,5 +1,4 @@
 from sae_variants import *
-from mandala.all import *
 from ioi_utils import *
 from tqdm import tqdm
 from typing import Dict, Any, Optional

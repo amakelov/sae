@@ -53,7 +53,7 @@ def get_freqs(encoder: AutoEncoder, A: Tensor, batch_size: Optional[int] = None)
     frac_dead = (act_freq_scores==0).float().mean().item()
     return act_freq_scores, frac_dead
 
-@op(version=2)
+@op
 def get_high_f1_features(
     encoder: Union[AutoEncoder, SparseAutoencoder],
     attributes: List[Tuple[str,...]],
@@ -95,7 +95,7 @@ def get_high_f1_features(
     f1_scores = {attr: v.values.T for attr, v in features_and_scores.items()}
     return features, f1_scores
 
-@op(version=1)
+@op
 def autointerp_fast(
     encoder: Union[AutoEncoder, SparseAutoencoder],
     features: List[Tuple[str,...]],
@@ -384,7 +384,7 @@ def compute_removed_weight(
     return best_weights.sum(dim=1)
 
 
-@op(version=2)
+@op
 @batched(args=['A_clean', 'A_cf', 'clean_prompts', 'cf_prompts',], n_outputs=3, reducer='cat', verbose=False)
 def get_edit_using_f1_scores(
     A_clean: Tensor,
@@ -501,7 +501,7 @@ def get_edit_using_f1_scores(
     return A_edited, features_to_remove, features_to_add
 
 
-@op(version=3)
+@op
 @batched(args=['A_clean', 'A_cf'], n_outputs=5, reducer='cat', verbose=False)
 def get_edit_using_sae_opt(
     A_clean: Tensor,
@@ -579,7 +579,7 @@ def get_edit_using_sae_opt(
     return A_edited, best_features, best_scores, edited_clean, edited_cf
 
 
-@op(version=1)
+@op
 def get_edit_using_sae_2(
     A_clean: Tensor,
     A_cf: Tensor,
@@ -668,7 +668,7 @@ def keep_features(
     A = A - feature_contribution
     return A
 
-@op(version=2)
+@op
 def get_interp_intervention(
     prompts: Any, # List[Prompt]
     nodes: List[Node],
