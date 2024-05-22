@@ -9,18 +9,40 @@ from torch.utils.data import DataLoader
 from einops import rearrange
 from transformer_lens import utils
 
+
+from mandala._next.imports import op
+from typing import Tuple
+
+
+@op
+def normalize_activations(A: Tensor) -> Tuple[Tensor, float]:
+    """
+    Normalize activations following
+    https://transformer-circuits.pub/2024/april-update/index.html#training-saes:
+    multiply by a scalar so that the average norm is sqrt(dimension)
+    """
+    assert len(A.shape) == 2
+    d_activation = A.shape[1]
+    avg_norm = A.norm(p=2, dim=1).mean()
+    normalization_scale = avg_norm / d_activation ** 0.5
+    return A / normalization_scale, normalization_scale
+
+
 class VanillaAutoEncoder(nn.Module):
     def __init__(self, 
                  d_activation: int,
                  d_hidden: int,
                  enc_dtype: str = "fp32",
                  freeze_decoder: bool = False,
+                 random_seed: int = 0,
                  ):
         super().__init__()
         self.d_activation = d_activation
         self.d_hidden = d_hidden
         self.freeze_decoder = freeze_decoder
         dtype = torch.float32 if enc_dtype == "fp32" else torch.float16
+        # set the random seed before initializing the weights
+        torch.manual_seed(random_seed)
         self.W_enc = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_activation, self.d_hidden, dtype=dtype)))
         self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(self.d_hidden, d_activation, dtype=dtype)))
         if freeze_decoder:

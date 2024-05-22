@@ -46,8 +46,8 @@ FEATURE_SIZES = {
 
 # this collects possible ways to parametrize activations of the model
 FEATURE_CONFIGURATIONS = {
-    'coupled': [('io', 'io_pos'), ('s', 'io_pos'), ],
     'independent': [('io', ), ('s', ), ('io_pos',)],
+    'coupled': [('io', 'io_pos'), ('s', 'io_pos'), ],
     'coupled_with_gender': [('io', 'io_pos'), ('s', 'io_pos'), ('io_gender',), ('s_gender',)],
     'independent_with_gender': [('io', ), ('s', ), ('io_pos',), ('io_gender',), ('s_gender',)],
     'independent_gender_only': [('io_gender', ), ('s_gender', ), ('io_pos',),],

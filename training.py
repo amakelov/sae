@@ -55,9 +55,9 @@ BATCH_SIZE = 512 # a somewhat lower batch size because our dataset is very small
 ################################################################################
 ### vanilla SAEs
 ################################################################################
+@op
 def train_vanilla(
     A: Tensor,
-    d_activation: int, 
     d_hidden: int,
     start_epoch: int,
     end_epoch: int,
@@ -73,8 +73,9 @@ def train_vanilla(
     resample_warmup_steps: int = 100, # following https://arxiv.org/pdf/2404.16014 etc. 
     torch_random_seed: int = 42,
     freeze_decoder: bool = False,
-    ): 
+    ) -> Tuple[Dict[str, Tensor], dict, dict, List[Dict[str, float]]]:
     torch.manual_seed(torch_random_seed)
+    d_activation = A.shape[1]
     encoder = VanillaAutoEncoder(d_activation=d_activation, 
                             d_hidden=d_hidden, freeze_decoder=freeze_decoder).cuda()
     encoder.load_state_dict(encoder_state_dict, strict=True)
@@ -91,6 +92,7 @@ def train_vanilla(
             "l2_loss": 0,
             "l1_loss": 0,
             "l0_loss": 0,
+            "dead_mask": Tensor([True for _ in range(d_hidden)]).cuda().bool(), # dead neurons throughout the entire epoch
         }
         feature_counts = 0
         for i in range(0, n, batch_size):
@@ -107,16 +109,20 @@ def train_vanilla(
             epoch_metrics["l1_loss"] += l1_loss.item() * actual_batch_size
             epoch_metrics["l0_loss"] += (acts > 0).sum(dim=-1).float().mean().item() * actual_batch_size
             feature_counts += (acts > 0).float().sum(dim=0)
+            dead_features_batch = (acts > 0).sum(dim=0) == 0
+            epoch_metrics["dead_mask"] = epoch_metrics["dead_mask"] & dead_features_batch # take AND w/ False to indicate alive neurons
         epoch_metrics["l2_loss"] /= n
         epoch_metrics["l1_loss"] /= n
         epoch_metrics["l0_loss"] /= n
+        epoch_metrics['frac_dead'] = epoch_metrics["dead_mask"].float().mean().item()
         metrics.append(epoch_metrics)
         if epoch != 0 and resample_every is not None and epoch % resample_every == 0:
             dead_indices = (feature_counts < 1).nonzero().squeeze()
             if len(dead_indices) > 0:
                 resample_vanilla(encoder, dead_indices, A, l1_coeff, optim)
                 scheduler.start_warmup()
-        pbar.set_description(f"l2_loss: {epoch_metrics['l2_loss']:.4f}, l1_loss: {epoch_metrics['l1_loss']:.4f}, l0_loss: {epoch_metrics['l0_loss']:.4f}")
+        pbar.set_description(f"l2_loss: {epoch_metrics['l2_loss']:.4f}, l1_loss: {epoch_metrics['l1_loss']:.4f}, \
+                             l0_loss: {epoch_metrics['l0_loss']:.4f}, frac_dead: {epoch_metrics['frac_dead']:.4f}")
     return encoder.state_dict(), optim.state_dict(), scheduler.state_dict(), metrics
 
 
