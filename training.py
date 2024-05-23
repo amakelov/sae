@@ -418,12 +418,12 @@ def resample_gated(encoder: GatedAutoEncoder, dead_indices: Tensor, A: Tensor, l
         A_batch = A[i:i+batch_size]
         f_tilde, pi_gate, L_sparsity = encoder.encode(A_batch)
         A_hat, L_reconstruct, L_aux = encoder.decode(f_tilde, pi_gate, A_batch)
-        L_reconstruct_parts.append(L_reconstruct)
-        L_sparsity_parts.append(L_sparsity)
-        L_aux_parts.append(L_aux)
-    L_reconstruct = torch.cat(L_reconstruct_parts)
-    L_sparsity = torch.cat(L_sparsity_parts)
-    L_aux = torch.cat(L_aux_parts)
+        L_reconstruct_parts.extend([L_reconstruct.item()] * A_batch.shape[0])
+        L_sparsity_parts.extend([L_sparsity.item()] * A_batch.shape[0])
+        L_aux_parts.extend([L_aux.item()] * A_batch.shape[0])
+    L_reconstruct = torch.Tensor(L_reconstruct_parts).cuda()
+    L_sparsity = torch.Tensor(L_sparsity_parts).cuda()
+    L_aux = torch.Tensor(L_aux_parts).cuda()
     total_losses = L_reconstruct + L_sparsity * l1_coeff + L_aux
     squared_losses = total_losses ** 2
 
@@ -437,7 +437,7 @@ def resample_gated(encoder: GatedAutoEncoder, dead_indices: Tensor, A: Tensor, l
 
     ### re-initialize decoder and encoder weights
     encoder.W_dec.data[dead_indices, :] = A[sample_indices] / A[sample_indices].norm(dim=-1, keepdim=True)
-    encoder.W_gate.data[:, dead_indices] = encoder.W_gate.data[dead_indices, :].T.clone()
+    encoder.W_gate.data[:, dead_indices] = encoder.W_dec.data[dead_indices, :].T.detach().clone()
     # ? not specified in the paper, defaulting to 0 (so, factor of 1 after exp)
     encoder.r_mag.data[dead_indices] = 0.0 
     # now, figure out the average norm of W_gate over alive neurons
