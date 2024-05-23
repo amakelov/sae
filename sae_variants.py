@@ -53,21 +53,21 @@ class VanillaAutoEncoder(nn.Module):
         # initialize W_enc from W_dec, following https://transformer-circuits.pub/2024/april-update/index.html#training-saes
         self.W_enc.data = self.W_dec.data.T.detach().clone()
     
-    def forward_detailed(self, x):
-        x_cent = x - self.b_dec
+    def forward_detailed(self, A: Tensor):
+        x_cent = A - self.b_dec 
         acts = F.relu(x_cent @ self.W_enc + self.b_enc)
         x_reconstruct = acts @ self.W_dec + self.b_dec
 
-        l2_losses = (x_reconstruct.float() - x.float()).pow(2).sum(-1)
+        l2_losses = (x_reconstruct.float() - A.float()).pow(2).sum(-1)
         l1_losses = acts.float().abs().sum(-1)
         return x_reconstruct, acts, l2_losses, l1_losses
     
-    def get_reconstruction(self, x) -> Tensor:
-        x_reconstruct, _, _, _ = self.forward_detailed(x)
+    def get_reconstruction(self, A: Tensor) -> Tensor:
+        x_reconstruct, _, _, _ = self.forward_detailed(A)
         return x_reconstruct
     
-    def forward(self, x):
-        x_reconstruct, acts, l2_losses, l1_losses = self.forward_detailed(x)
+    def forward(self, A: Tensor):
+        x_reconstruct, acts, l2_losses, l1_losses = self.forward_detailed(A)
         
         l2_loss = l2_losses.mean()
         l1_loss = l1_losses.mean()
@@ -84,8 +84,27 @@ class VanillaAutoEncoder(nn.Module):
         # Bugfix(?) for ensuring W_dec retains unit norm, this was not there when I trained my original autoencoders.
         self.W_dec.data = W_dec_normed
 
+    ### encapsulate some pieces of logic here w/ no_grad to avoid bugs
+    @torch.no_grad()
+    def get_activation_pattern(self, A: Tensor) -> Tensor:
+        _, acts, _, _ = self.forward_detailed(A)
+        return (acts > 0).bool()
+    
+    @torch.no_grad()
+    def get_feature_magnitudes(self, A: Tensor) -> Tensor:
+        _, acts, _, _ = self.forward_detailed(A)
+        return acts
+    
+    @torch.no_grad()
+    def get_reconstructions(self, A: Tensor) -> Tensor:
+        x_reconstruct, _, _, _ = self.forward_detailed(A)
+        return x_reconstruct
+
 
 class GatedAutoEncoder(nn.Module):
+    """
+    Following the Gated SAE paper https://arxiv.org/pdf/2404.16014
+    """
     def __init__(self, d_activation: int, d_hidden: int):
         super().__init__()
         self.d_activation = d_activation
@@ -138,3 +157,26 @@ class GatedAutoEncoder(nn.Module):
         W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
         self.W_dec.grad -= W_dec_grad_proj
         self.W_dec.data = W_dec_normed
+
+    ### encapsulate some pieces of logic here w/ no_grad to avoid bugs
+    @torch.no_grad()
+    def get_activation_pattern(self, X: Tensor):
+        _, pi_gate, _ = self.encode(X)
+        return (pi_gate > 0).bool()
+    
+    @torch.no_grad()
+    def get_feature_magnitudes(self, X: Tensor) -> Tensor:
+        """
+        This returns the actual magnitudes in the decomposition x_hat = sum_j
+        f_j W_dec_j + b_dec
+        """
+        # use f_tilde, because X_hat = f_tilde @ W_dec + b_dec
+        f_tilde, _, _ = self.encode(X)
+        return f_tilde
+    
+    @torch.no_grad()
+    def get_reconstructions(self, X: Tensor):
+        f_tilde, pi_gate, _ = self.encode(X)
+        X_hat, _, _ = self.decode(f_tilde, pi_gate, X)
+        return X_hat
+    
