@@ -43,13 +43,15 @@ class VanillaAutoEncoder(nn.Module):
         dtype = torch.float32 if enc_dtype == "fp32" else torch.float16
         # set the random seed before initializing the weights
         torch.manual_seed(random_seed)
-        self.W_enc = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_activation, self.d_hidden, dtype=dtype)))
         self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(self.d_hidden, d_activation, dtype=dtype)))
         if freeze_decoder:
             self.W_dec.requires_grad = False
         self.b_enc = nn.Parameter(torch.zeros(self.d_hidden, dtype=dtype))
         self.b_dec = nn.Parameter(torch.zeros(d_activation, dtype=dtype))
         self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
+        self.W_enc = nn.Parameter(torch.empty(d_activation, d_hidden, dtype=dtype))
+        # initialize W_enc from W_dec, following https://transformer-circuits.pub/2024/april-update/index.html#training-saes
+        self.W_enc.data = self.W_dec.data.T.detach().clone()
     
     def forward_detailed(self, x):
         x_cent = x - self.b_dec
@@ -60,13 +62,11 @@ class VanillaAutoEncoder(nn.Module):
         l1_losses = acts.float().abs().sum(-1)
         return x_reconstruct, acts, l2_losses, l1_losses
     
+    def get_reconstruction(self, x) -> Tensor:
+        x_reconstruct, _, _, _ = self.forward_detailed(x)
+        return x_reconstruct
+    
     def forward(self, x):
-        # x_cent = x - self.b_dec
-        # acts = F.relu(x_cent @ self.W_enc + self.b_enc)
-        # x_reconstruct = acts @ self.W_dec + self.b_dec
-
-        # l2_losses = (x_reconstruct.float() - x.float()).pow(2).sum(-1)
-        # l1_losses = acts.float().abs().sum(-1)
         x_reconstruct, acts, l2_losses, l1_losses = self.forward_detailed(x)
         
         l2_loss = l2_losses.mean()
@@ -140,4 +140,3 @@ class GatedAutoEncoder(nn.Module):
         W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
         self.W_dec.grad -= W_dec_grad_proj
         self.W_dec.data = W_dec_normed
-    

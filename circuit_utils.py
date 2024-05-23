@@ -101,10 +101,6 @@ def get_cf_prompts(
     return prompts
 
 @op
-def get_dataset_mean(A: Tensor) -> Tensor:
-    return A.mean(dim=0)
-
-@op
 def generate_prompts(distribution: PromptDistribution, patterns: List[str], 
                      prompts_per_pattern: int, random_seed: int,
                      ) -> Any:

@@ -232,27 +232,6 @@ def mean_ablate_hook(activation: Tensor, hook: HookPoint, node: Node, mean: Tens
     activation[idx] = mean
     return activation
 
-@op
-def compute_mean_ablated_lds(
-    node: Node,
-    prompts: Any,
-    A_mean: Tensor,
-    batch_size: int,
-) -> float:
-    if GlobalContext.current is not None:
-        c = GlobalContext.current
-    else:
-        c = Context()
-    with c(mode='noop'):
-        mean_ablated_logits = run_with_hooks(
-            prompts=prompts,
-            hooks=None,
-            semantic_nodes=[node],
-            semantic_hooks=[(node.activation_name, partial(mean_ablate_hook, node=node, mean=A_mean))],
-            batch_size=batch_size,
-        )
-    mean_ablated_ld = (mean_ablated_logits[:, 0] - mean_ablated_logits[:, 1]).mean().item()
-    return mean_ablated_ld
 
 def encoder_hook(activation: Tensor, hook: HookPoint, node: Node, encoder: AutoEncoder,
                  idx: Tensor, normalization_scale: Optional[float] = None,

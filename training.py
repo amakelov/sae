@@ -5,52 +5,70 @@ from typing import Dict, Any, Optional
 
 from torch.optim.lr_scheduler import _LRScheduler
 
-class MidTrainingWarmupScheduler(_LRScheduler):
+class DefaultConfig:
+    # following https://transformer-circuits.pub/2024/april-update/index.html#training-saes
+    BETA_1 = 0.9 
+    BETA_2 = 0.999
+    WEIGHT_DECAY = 0.0
+    L1_COEFF = 5.0
+    # slightly larger
+    LR = 3e-4 
+    RESAMPLE_WARMUP_STEPS = 100 # following https://arxiv.org/pdf/2404.16014 etc. 
+    # a somewhat lower batch size because our dataset is very small
+    BATCH_SIZE = 512 
+
+
+class SAELRScheduler(_LRScheduler):
     """
     A learning rate scheduler that performs a linear warmup for the first
     `num_warmup_steps`, otherwise keeping the learning rate constant.
     """
-    def __init__(self, optimizer, num_warmup_steps, last_epoch=-1):
+    def __init__(self, optimizer, 
+                 num_warmup_steps: int,
+                 final_decay_start: int = 0,
+                 final_decay_end: int = 0,
+                 last_epoch=-1):
         self.num_warmup_steps = num_warmup_steps
+        self.final_decay_start = final_decay_start
+        self.final_decay_end = final_decay_end
         self.initial_lrs = [group['lr'] for group in optimizer.param_groups]
         self.current_step = 0
+        self.current_warmup_start = None
         self.in_warmup = False
         self.warmup_start_lrs = [0.0] * len(self.initial_lrs)
         super().__init__(optimizer, last_epoch)
 
     def start_warmup(self):
         self.in_warmup = True
-        self.current_step = 0
+        # self.current_step = 0
+        self.current_warmup_start = self.current_step
         self.warmup_start_lrs = [group['lr'] for group in self.optimizer.param_groups]
         for i, group in enumerate(self.optimizer.param_groups):
             group['lr'] = 0.1 * self.warmup_start_lrs[i]
 
     def get_lr(self):
-        if not self.in_warmup:
+        if self.in_warmup and self.current_step >= self.final_decay_start:
+            raise ValueError("Cannot be in warmup and final decay at the same time") 
+        if self.current_step >= self.final_decay_start:
+            # decay lr linearly to 0 
+            decay_progress = (self.current_step - self.final_decay_start) / (self.final_decay_end - self.final_decay_start)
+            return [group['lr'] * (1 - decay_progress) for group in self.optimizer.param_groups]
+        elif not self.in_warmup:
             return [group['lr'] for group in self.optimizer.param_groups]
-        
-        if self.current_step >= self.num_warmup_steps:
-            self.in_warmup = False
-            return self.initial_lrs
-        
-        warmup_factor = (self.current_step + 1) / self.num_warmup_steps
-        return [
-            base_lr * (0.1 + 0.9 * warmup_factor)
-            for base_lr in self.initial_lrs
-        ]
+        else:
+            warmup_progress = (self.current_step - self.current_warmup_start) / self.num_warmup_steps
+            return [
+                base_lr * (0.1 + 0.9 * warmup_progress)
+                for base_lr in self.warmup_start_lrs
+            ]
 
     def step(self, epoch=None):
-        if self.in_warmup:
-            self.current_step += 1
+        self.current_step += 1
+        if self.current_warmup_start is not None:
+            if self.current_step - self.current_warmup_start >= self.num_warmup_steps:
+                self.in_warmup = False
+                self.current_warmup_start = None
         super().step(epoch)
-
-
-BETA_1 = 0.0 # following https://transformer-circuits.pub/2024/feb-update/index.html
-BETA_2 = 0.999
-L1_COEFF = 5.0
-LR = 0.0003 # following https://arxiv.org/pdf/2404.16014
-BATCH_SIZE = 512 # a somewhat lower batch size because our dataset is very small
-
 
 ################################################################################
 ### vanilla SAEs
@@ -64,31 +82,42 @@ def train_vanilla(
     encoder_state_dict: Optional[Dict[str, Tensor]],
     optimizer_state_dict: Optional[Any],
     scheduler_state_dict: Optional[Any],
-    l1_coeff: float = L1_COEFF,
-    lr: float=LR,
-    beta1: float=BETA_1,
-    beta2: float=BETA_2,
-    batch_size: int = BATCH_SIZE,
-    resample_every: Optional[int] = None,
-    resample_warmup_steps: int = 100, # following https://arxiv.org/pdf/2404.16014 etc. 
+    l1_coeff: float = DefaultConfig.L1_COEFF,
+    lr: float=DefaultConfig.LR,
+    beta1: float=DefaultConfig.BETA_1,
+    beta2: float=DefaultConfig.BETA_2,
+    weight_decay: float = DefaultConfig.WEIGHT_DECAY,
+    batch_size: int = DefaultConfig.BATCH_SIZE,
+    resample_epochs: Optional[List[int]] = None,
+    resample_warmup_steps: int = DefaultConfig.RESAMPLE_WARMUP_STEPS, 
     torch_random_seed: int = 42,
     freeze_decoder: bool = False,
+    final_decay_start: int = 2_000,
+    final_decay_end: int = 2_500,
+    enc_dtype: str = "fp32",
     ) -> Tuple[Dict[str, Tensor], dict, dict, List[Dict[str, float]]]:
     torch.manual_seed(torch_random_seed)
     d_activation = A.shape[1]
-    encoder = VanillaAutoEncoder(d_activation=d_activation, 
+    if encoder_state_dict is None:
+        assert optimizer_state_dict is None and scheduler_state_dict is None
+    encoder = VanillaAutoEncoder(d_activation=d_activation, enc_dtype=enc_dtype,
                             d_hidden=d_hidden, freeze_decoder=freeze_decoder).cuda()
-    encoder.load_state_dict(encoder_state_dict, strict=True)
-    optim = torch.optim.Adam(encoder.parameters(), lr=lr, betas=(beta1, beta2))
-    optim.load_state_dict(optimizer_state_dict)
-    scheduler = MidTrainingWarmupScheduler(optim, resample_warmup_steps)
-    scheduler.load_state_dict(scheduler_state_dict)
+    if encoder_state_dict is not None:
+        encoder.load_state_dict(encoder_state_dict, strict=True)
+    optim = torch.optim.Adam(encoder.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=weight_decay)
+    if optimizer_state_dict is not None:
+        optim.load_state_dict(optimizer_state_dict)
+    scheduler = SAELRScheduler(optim, num_warmup_steps=resample_warmup_steps, 
+                              final_decay_start=final_decay_start, final_decay_end=final_decay_end)
+    if scheduler_state_dict is not None:
+        scheduler.load_state_dict(scheduler_state_dict)
     pbar = tqdm(range(start_epoch, end_epoch))
     n = A.shape[0]
     metrics = []
     for epoch in pbar:
         perm = torch.randperm(n)
         epoch_metrics = {
+            'epoch': epoch, # to keep track of the epoch
             "l2_loss": 0,
             "l1_loss": 0,
             "l0_loss": 0,
@@ -101,9 +130,8 @@ def train_vanilla(
             A_hat, acts, l2_loss, l1_loss = encoder(A_batch)
             loss = l2_loss + l1_loss * l1_coeff
             loss.backward()
-            encoder.make_decoder_weights_and_grad_unit_norm()
             optim.step()
-            scheduler.step()
+            encoder.make_decoder_weights_and_grad_unit_norm()
             actual_batch_size = A_batch.shape[0]
             epoch_metrics["l2_loss"] += l2_loss.item() * actual_batch_size
             epoch_metrics["l1_loss"] += l1_loss.item() * actual_batch_size
@@ -111,18 +139,24 @@ def train_vanilla(
             feature_counts += (acts > 0).float().sum(dim=0)
             dead_features_batch = (acts > 0).sum(dim=0) == 0
             epoch_metrics["dead_mask"] = epoch_metrics["dead_mask"] & dead_features_batch # take AND w/ False to indicate alive neurons
+        scheduler.step()
         epoch_metrics["l2_loss"] /= n
         epoch_metrics["l1_loss"] /= n
         epoch_metrics["l0_loss"] /= n
         epoch_metrics['frac_dead'] = epoch_metrics["dead_mask"].float().mean().item()
+        num_alive = (1-epoch_metrics['frac_dead'])*d_hidden
+        del epoch_metrics["dead_mask"]
         metrics.append(epoch_metrics)
-        if epoch != 0 and resample_every is not None and epoch % resample_every == 0:
+        if resample_epochs is not None and epoch in resample_epochs:
             dead_indices = (feature_counts < 1).nonzero().squeeze()
+            # make sure dead_indices is not 0-dimensional
+            if len(dead_indices.shape) == 0:
+                dead_indices = dead_indices.unsqueeze(0)
             if len(dead_indices) > 0:
                 resample_vanilla(encoder, dead_indices, A, l1_coeff, optim)
                 scheduler.start_warmup()
-        pbar.set_description(f"l2_loss: {epoch_metrics['l2_loss']:.4f}, l1_loss: {epoch_metrics['l1_loss']:.4f}, \
-                             l0_loss: {epoch_metrics['l0_loss']:.4f}, frac_dead: {epoch_metrics['frac_dead']:.4f}")
+        pbar.set_description(f"l2_loss: {epoch_metrics['l2_loss']:.4f}, l1_loss: {epoch_metrics['l1_loss']:.4f}, " + 
+                             f"l0_loss: {epoch_metrics['l0_loss']:.4f}, frac_dead: {epoch_metrics['frac_dead']:.4f}")
     return encoder.state_dict(), optim.state_dict(), scheduler.state_dict(), metrics
 
 
@@ -186,7 +220,92 @@ def reset_adam_optimizer_params(optimizer: torch.optim.Adam, param: torch.nn.Par
         if state in ['exp_avg', 'exp_avg_sq']:
             optimizer.state[param][state][param_idx] = torch.zeros_like(optimizer.state[param][state][param_idx])
 
+################################################################################
+### computing the logitdiff loss
+################################################################################
+@op
+def get_dataset_mean(A: Tensor) -> Tensor:
+    return A.mean(dim=0)
 
+def mean_ablate_hook(activation: Tensor, hook: HookPoint, node: Node, mean: Tensor, idx: Tensor) -> Tensor:
+    activation[idx] = mean
+    return activation
+
+@torch.no_grad()
+def encoder_hook(activation: Tensor, hook: HookPoint, node: Node, encoder: Union[VanillaAutoEncoder, GatedAutoEncoder],
+                 idx: Tensor, ) -> Tensor:
+    A = activation[idx]
+    reconstruction = encoder.get_reconstruction(A)
+    activation[idx] = reconstruction
+    return activation
+
+@op
+def compute_mean_ablated_lds(
+    node: Node,
+    prompts: Any,
+    A_mean: Tensor,
+    batch_size: int,
+) -> float:
+    mean_ablated_logits = run_with_hooks.f(
+        prompts=prompts,
+        hooks=None,
+        semantic_nodes=[node],
+        semantic_hooks=[(node.activation_name, partial(mean_ablate_hook, node=node, mean=A_mean))],
+        batch_size=batch_size,
+    )
+    mean_ablated_ld = (mean_ablated_logits[:, 0] - mean_ablated_logits[:, 1]).mean().item()
+    return mean_ablated_ld
+
+@torch.no_grad()
+def get_logitdiff_loss(
+    encoder: Any, node: Node, prompts: List[Prompt], batch_size: int,
+    normalization_scale: Optional[float] = None,
+    clean_ld: Optional[float] = None, mean_ablated_ld: Optional[float] = None,
+    ) -> float:
+    mean_ablated_ld = mean_ablated_ld
+    encoder_logits = run_with_hooks(
+        prompts=prompts,
+        hooks=None,
+        semantic_nodes=[node],
+        semantic_hooks=[(node.activation_name, partial(encoder_hook, node=node, encoder=encoder, normalization_scale=normalization_scale))],
+        batch_size=batch_size,
+    )
+    encoder_ld = (encoder_logits[:, 0] - encoder_logits[:, 1]).mean().item()
+    # score = (clean_ld - encoder_ld) / (clean_ld - mean_ablated_ld)
+    score = (encoder_ld - mean_ablated_ld).abs().item() / (clean_ld - mean_ablated_ld).abs().item()
+    return score
+
+@op
+def eval_ld_loss(
+    encoder: VanillaAutoEncoder,
+    A_mean: Tensor,
+    prompts: Any,
+    node: Node,
+    ld_subsample_size: Optional[int] = None,
+    normalize: bool = False,
+    A: Optional[Tensor] = None,
+    return_additional_metrics: bool = False,
+    random_seed: int = 42,
+    mean_clean_ld: Optional[float] = None,
+    mean_ablated_ld: Optional[float] = None,
+    ) -> float:
+    if normalize:
+        assert A is not None
+        _, normalization_scale = normalize_sae_inputs(A)
+    else:
+        normalization_scale = None
+    if ld_subsample_size is not None:
+        random.seed(random_seed)
+        ld_loss_prompts = random.sample(prompts, ld_subsample_size)
+    else:
+        ld_loss_prompts = prompts
+    ld_loss, clean_ld_mean, ablated_ld_mean, encoder_ld_mean = get_logitdiff_loss(encoder=encoder, node=node, prompts=ld_loss_prompts,
+                                                                                  batch_size=200, activation_mean=A_mean, normalization_scale=normalization_scale,
+                                                                                  mean_clean_ld=mean_clean_ld, mean_ablated_ld=mean_ablated_ld)
+    if return_additional_metrics:
+        return (ld_loss, clean_ld_mean, ablated_ld_mean, encoder_ld_mean)
+    else:
+        return ld_loss
 
 ################################################################################
 ### Gated SAEs
@@ -200,12 +319,12 @@ def train_gated(
     encoder_state_dict: Optional[Dict[str, Tensor]],
     optimizer_state_dict: Optional[Any],
     scheduler_state_dict: Optional[Any],
-    l1_coeff: float = L1_COEFF,
-    lr: float=LR,
-    beta1: float=BETA_1,
-    beta2: float=BETA_2,
-    batch_size: int = BATCH_SIZE,
-    resample_every: Optional[int] = None,
+    l1_coeff: float = DefaultConfig.L1_COEFF,
+    lr: float=DefaultConfig.LR,
+    beta1: float=DefaultConfig.BETA_1,
+    beta2: float=DefaultConfig.BETA_2,
+    batch_size: int = DefaultConfig.BATCH_SIZE,
+    resample_epochs: List[int] = None,
     resample_warmup_steps: int = 100, # following https://arxiv.org/pdf/2404.16014 etc. 
     torch_random_seed: int = 42,
     ):
@@ -217,7 +336,7 @@ def train_gated(
     encoder.load_state_dict(encoder_state_dict, strict=True)
     optim = torch.optim.Adam(encoder.parameters(), lr=lr, betas=(beta1, beta2))
     optim.load_state_dict(optimizer_state_dict)
-    scheduler = MidTrainingWarmupScheduler(optim, resample_warmup_steps)
+    scheduler = SAELRScheduler(optim, resample_warmup_steps)
     scheduler.load_state_dict(scheduler_state_dict)
     pbar = tqdm(range(start_epoch, end_epoch))
     n = A.shape[0]
