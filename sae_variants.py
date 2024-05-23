@@ -110,32 +110,30 @@ class GatedAutoEncoder(nn.Module):
     def encode(self, X: Tensor):
         # using the paper's notation
         X_centered = X - self.b_dec
-        pi_gate = einsum(self.W_gate, X_centered, 'dim hidden, batch dim -> batch hidden') + self.b_gate
+        pi_gate = einsum( 'dim hidden, batch dim -> batch hidden', self.W_gate, X_centered,) + self.b_gate
         # f_gate gives the activation pattern for the hidden layer
         f_gate = (pi_gate > 0).float()
-        W_mag = einsum(torch.exp(self.r_mag), self.W_gate, 'hidden, dim hidden -> dim hidden')
-        f_mag = einsum(W_mag, X_centered, 'dim hidden, batch dim -> batch hidden') + self.b_mag
+        W_mag = einsum( 'hidden, dim hidden -> dim hidden', torch.exp(self.r_mag), self.W_gate,)
+        f_mag = einsum('dim hidden, batch dim -> batch hidden', W_mag, X_centered, ) + self.b_mag
         f_tilde = f_gate * f_mag
         L_sparsity = nn.ReLU()(pi_gate).norm(dim=1, p=1).mean()
         return f_tilde, pi_gate, L_sparsity
     
     def decode(self, f_tilde: Tensor, pi_gate: Tensor, X: Tensor):
-        x_hat = einsum(f_tilde, self.W_dec, 'batch hidden, hidden dim -> batch dim') + self.b_dec
-        L_reconstruct = (x_hat - f_tilde).norm(dim=1, p=2).mean()
+        X_hat = einsum('batch hidden, hidden dim -> batch dim', f_tilde, self.W_dec, ) + self.b_dec
+        L_reconstruct = (X_hat - X).pow(2).sum(dim=1).mean()
         
         # compute the auxiliary loss
         W_dec_clone = self.W_dec.clone().detach()
         b_dec_clone = self.b_dec.clone().detach()
         x_hat_frozen = einsum(
-            nn.ReLU()(pi_gate), W_dec_clone, 'batch hidden, hidden dim -> batch dim'
+            'batch hidden, hidden dim -> batch dim', nn.ReLU()(pi_gate), W_dec_clone, 
         ) + b_dec_clone
-        L_aux = (X - x_hat_frozen).norm(dim=1, p=2).mean()
-        return x_hat, L_reconstruct, L_aux
+        L_aux = (X - x_hat_frozen).pow(2).sum(dim=1).mean()
+        return X_hat, L_reconstruct, L_aux
 
     @torch.no_grad()
     def make_decoder_weights_and_grad_unit_norm(self):
-        if self.freeze_decoder:
-            return
         W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
         W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
         self.W_dec.grad -= W_dec_grad_proj
