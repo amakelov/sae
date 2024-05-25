@@ -86,7 +86,7 @@ def get_high_f1_features(
     prompt_feature_idxs: Any,
     A_normalized: Tensor, # must be normalized for the encoder
     topk: int,
-) -> Tuple[Any, Any]:
+) -> Tuple[Dict[str, Tensor], Dict[str, Tensor]]:
     """
     Given some attributes, find the top features wrt these attributes based on
     the F1 score; return the features together with their scores.

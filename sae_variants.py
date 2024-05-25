@@ -13,6 +13,8 @@ from transformer_lens import utils
 from mandala._next.imports import op
 from typing import Tuple
 
+from ioi_utils import *
+
 
 @op
 def normalize_activations(A: Tensor) -> Tuple[Tensor, float]:
@@ -180,3 +182,175 @@ class GatedAutoEncoder(nn.Module):
         X_hat, _, _ = self.decode(f_tilde, pi_gate, X)
         return X_hat
     
+
+
+
+################################################################################
+### Attribution SAEs
+################################################################################
+# attribution SAEs are basically vanilla SAEs, but with a different loss
+# function
+
+class AttributionAutoEncoder(VanillaAutoEncoder):
+    """
+    Following https://transformer-circuits.pub/2024/april-update/index.html#attr-dl
+    """
+    def forward_detailed(self, A: Tensor, A_grad: Tensor):
+        A_centered = A - self.b_dec 
+        acts = F.relu(A_centered @ self.W_enc + self.b_enc)
+        A_hat = acts @ self.W_dec + self.b_dec
+
+        l2_losses = (A_hat.float() - A.float()).pow(2).sum(-1)
+        l1_losses = acts.float().abs().sum(-1)
+
+        # and now, two new losses
+        # in the notation of the blog post,
+        # hidden activations are y (d_hidden,)
+        # the reconstructions are x_hat = y @ W_dec + b_dec
+        # the gradient w.r.t. the *hidden* activations is
+        # grad_y (metric) = grad_x_hat (metric) @ W_dec.T
+        # and b/c we don't want to compute all the gradients for reconstructions
+        # we just use grad_x (metric), lol
+
+        attribution_sparsity_losses = (acts * (einsum('batch act_dim, hidden act_dim -> batch hidden', A_grad, self.W_dec))).abs().sum(-1)
+        unexplained_attribution_losses = einsum("batch act_dim, batch act_dim -> batch", A - A_hat, A_grad).abs()
+
+        return A_hat, acts, l2_losses, l1_losses, attribution_sparsity_losses, unexplained_attribution_losses
+    
+    def get_reconstruction(self, A: Tensor) -> Tensor:
+        x_reconstruct, _, _, _ = self.forward_detailed(A)
+        return x_reconstruct
+    
+    def forward(self, A: Tensor, A_grad: Tensor):
+        x_reconstruct, acts, l2_losses, l1_losses, attribution_sparsity_losses, unexplained_attribution_losses = self.forward_detailed(A, A_grad)
+        
+        l2_loss = l2_losses.mean()
+        l1_loss = l1_losses.mean()
+        attribution_sparsity_loss = attribution_sparsity_losses.mean()
+        unexplained_attribution_loss = unexplained_attribution_losses.mean()
+        return x_reconstruct, acts, l2_loss, l1_loss, attribution_sparsity_loss, unexplained_attribution_loss
+
+    @torch.no_grad()
+    def make_decoder_weights_and_grad_unit_norm(self):
+        if self.freeze_decoder:
+            return
+        W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
+        W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
+        self.W_dec.grad -= W_dec_grad_proj
+        # Bugfix(?) for ensuring W_dec retains unit norm, this was not there when I trained my original autoencoders.
+        self.W_dec.data = W_dec_normed
+
+    ### encapsulate some pieces of logic here w/ no_grad to avoid bugs
+    @torch.no_grad()
+    def get_activation_pattern(self, A: Tensor) -> Tensor:
+        _, acts, _, _ = self.forward_detailed(A)
+        return (acts > 0).bool()
+    
+    @torch.no_grad()
+    def get_feature_magnitudes(self, A: Tensor) -> Tensor:
+        _, acts, _, _ = self.forward_detailed(A)
+        return acts
+    
+    @torch.no_grad()
+    def get_reconstructions(self, A: Tensor) -> Tensor:
+        x_reconstruct, _, _, _ = self.forward_detailed(A)
+        return x_reconstruct
+
+
+@op
+@batched(args=['prompts'], n_outputs=1, reducer='cat')
+def collect_gradients(
+        prompts: List[Prompt],
+        # layers_and_activations: List[Tuple[int, Literal['z', 'q', 'k']]],
+        nodes: List[Node],
+        batch_size: Optional[int] = None,
+        ) -> Dict[Node, Tensor]:
+    """
+    Given a list of prompts, collect the gradients of the logit difference with
+    respect to the given activation in the given layer. 
+
+    This will return a tensor of shape (n_prompts, seq_len, n_heads, head_dim)
+    from which you can then select gradients for desired heads and positions.
+    """
+    model: HookedTransformer = MODELS[MODEL_ID]
+    model.requires_grad_(True)
+    prompt_dataset = PromptDataset(prompts, model=model)
+
+    layers_and_activations = list({(node.layer, node.component_name) for node in nodes})
+
+    def get_forward_hook(location: Tuple[int, str]):
+        def hook(model, input, output):
+            activations[location] = output
+            output.retain_grad()
+        return hook
+    
+    def get_backward_hook(location: Tuple[int, str]):
+        def hook(grad):
+            grads[location] = grad
+        return hook
+    
+    activation_attrs = {
+        'z': 'hook_z',
+        'q': 'hook_q',
+        'k': 'hook_k',
+        'v': 'hook_v',
+    }
+
+    activations = {}
+    grads = {}
+
+    forward_handles = {}
+
+    for layer, activation_name in layers_and_activations:
+        location = (layer, activation_name)
+        forward_hook_handle = getattr(model.blocks[layer].attn, activation_attrs[activation_name]).register_forward_hook(get_forward_hook(location))
+        forward_handles[location] = forward_hook_handle
+    
+    input_tensor = prompt_dataset.tokens
+    # forward all the inputs ONCE
+    output = model(input_tensor)[:, -1, :]
+    # compute the tensor of logit differences that we want to take the gradient of
+    answer_logits = torch.gather(output, dim=1, index=prompt_dataset.answer_tokens.cuda())
+    ld = answer_logits[:, 0] - answer_logits[:, 1]
+
+    backward_handles = {}
+    for layer, activation_name in layers_and_activations:
+        activation = activations[(layer, activation_name)]
+        backward_hook_handle = activation.register_hook(get_backward_hook((layer, activation_name)))
+        backward_handles[(layer, activation_name)] = backward_hook_handle
+
+
+    individual_gradients = {}
+    for i in tqdm(range(len(prompt_dataset))): # iterate over the batch
+        # lol why isn't there (?) a way to get the batch of gradients in one go :(
+        # Backward pass
+        model.zero_grad() # make sure the model is zeroed out
+        ld[i].backward(retain_graph=True)
+        # The gradient of the loss with respect to the internal activation
+        for layer, activation_name in layers_and_activations:
+            if (layer, activation_name) not in individual_gradients:
+                individual_gradients[(layer, activation_name)] = []
+            internal_activation_grad = grads[(layer, activation_name)][i].detach().clone()
+            individual_gradients[(layer, activation_name)].append(internal_activation_grad)
+    
+    #! undo all the things we've done to the model
+    for layer, activation_name in layers_and_activations:
+        forward_hook_handle = forward_handles[(layer, activation_name)]
+        forward_hook_handle.remove()
+        backward_hook_handle = backward_handles[(layer, activation_name)]
+        backward_hook_handle.remove()
+    model.requires_grad_(False)
+
+    for key in individual_gradients:
+        individual_gradients[key] = torch.stack(individual_gradients[key], dim=0).cpu()
+    
+    # now, turn into a dict keyed by the nodes
+    node = nodes[0]
+
+    nodes_result = {}
+    for node in nodes:
+        layer, component_name = node.layer, node.component_name
+        full_grad = individual_gradients[(layer, component_name)]
+        nodes_result[node] = full_grad[node.idx(prompts=prompts)]
+
+    return nodes_result

@@ -78,15 +78,10 @@ def get_dataset_mean(A: Tensor) -> Tensor:
     return A.mean(dim=0)
 
 def mean_ablate_hook(activation: Tensor, hook: HookPoint, node: Node, mean: Tensor, idx: Tensor) -> Tensor:
+    """
+    lol, why is this a thing
+    """
     activation[idx] = mean
-    return activation
-
-@torch.no_grad()
-def encoder_hook(activation: Tensor, hook: HookPoint, node: Node, encoder: Union[VanillaAutoEncoder, GatedAutoEncoder],
-                 idx: Tensor, ) -> Tensor:
-    A = activation[idx]
-    reconstruction = encoder.get_reconstruction(A)
-    activation[idx] = reconstruction
     return activation
 
 @op
@@ -96,6 +91,9 @@ def compute_mean_ablated_lds(
     A_mean: Tensor,
     batch_size: int,
 ) -> float:
+    """
+    Get the mean-ablated logitdiff
+    """
     mean_ablated_logits = run_with_hooks.f(
         prompts=prompts,
         hooks=None,
@@ -107,22 +105,44 @@ def compute_mean_ablated_lds(
     return mean_ablated_ld
 
 @torch.no_grad()
+def encoder_hook(activation: Tensor, 
+                 hook: HookPoint,
+                 node: Node,
+                 encoder: Union[VanillaAutoEncoder, GatedAutoEncoder],
+                 idx: Tensor, 
+                 encoder_normalization_scale: float,
+                 ) -> Tensor:
+    """
+    Replace the activations at the given index with the reconstruction from the
+    encoder; computes reconstructions on the fly
+    """
+    A = activation[idx]
+    #! very important to normalize the activations before passing them to the encoder
+    reconstruction = encoder.get_reconstruction(A / encoder_normalization_scale) * encoder_normalization_scale
+    activation[idx] = reconstruction
+    return activation
+
+@op
 def get_logitdiff_loss(
-    encoder: Any, node: Node, prompts: List[Prompt], batch_size: int,
-    normalization_scale: Optional[float] = None,
-    clean_ld: Optional[float] = None, mean_ablated_ld: Optional[float] = None,
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder], 
+    encoder_normalization_scale: float,
+    node: Node,
+    prompts: List[Prompt],
+    batch_size: int,
+    clean_ld: Optional[float] = None,
+    mean_ablated_ld: Optional[float] = None,
     ) -> float:
     mean_ablated_ld = mean_ablated_ld
-    encoder_logits = run_with_hooks(
+    encoder_logits = run_with_hooks.f(
         prompts=prompts,
         hooks=None,
         semantic_nodes=[node],
-        semantic_hooks=[(node.activation_name, partial(encoder_hook, node=node, encoder=encoder, normalization_scale=normalization_scale))],
+        semantic_hooks=[(node.activation_name, partial(encoder_hook, node=node, encoder=encoder, encoder_normalization_scale=encoder_normalization_scale))],
         batch_size=batch_size,
     )
     encoder_ld = (encoder_logits[:, 0] - encoder_logits[:, 1]).mean().item()
     # score = (clean_ld - encoder_ld) / (clean_ld - mean_ablated_ld)
-    score = (encoder_ld - mean_ablated_ld).abs().item() / (clean_ld - mean_ablated_ld).abs().item()
+    score = abs(encoder_ld - mean_ablated_ld) / abs(clean_ld - mean_ablated_ld)
     return score
 
 @op
@@ -160,6 +180,21 @@ def eval_ld_loss(
 ################################################################################
 ### vanilla SAEs
 ################################################################################
+@op
+def get_vanilla(encoder_state_dict: Dict[str, Tensor], 
+                d_activation: int,
+                d_hidden: int,
+                enc_dtype: str = "fp32",
+                freeze_decoder: bool = False,
+                random_seed: int = 0) -> VanillaAutoEncoder:
+    """
+    Get a vanilla SAE with the given parameters
+    """
+    encoder = VanillaAutoEncoder(d_activation=d_activation, d_hidden=d_hidden, enc_dtype=enc_dtype, freeze_decoder=freeze_decoder, random_seed=random_seed).cuda()
+    encoder.load_state_dict(encoder_state_dict, strict=True)
+    return encoder
+
+
 @op
 def train_vanilla(
     A: Tensor,

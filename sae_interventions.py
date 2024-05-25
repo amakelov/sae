@@ -353,9 +353,6 @@ def get_interp_approximation_intervention(
     return answer_logits
 
 
-
-
-
 ### what
 @torch.no_grad()
 def get_freqs(encoder: AutoEncoder, A: Tensor, batch_size: Optional[int] = None) -> Tuple[Tensor, float]:
