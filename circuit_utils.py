@@ -166,6 +166,7 @@ def get_feature_deep_idx(feature: Tuple[str,...], prompt_rep: Dict[str, int]) ->
     # which is the dimension of the code vectors and may vary)
     return tuple([prompt_rep[f] for f in feature])
 
+@op
 def get_prompt_feature_idxs(prompts: Optional[Sequence[Prompt]],
                             features: List[Tuple[str,...]],
                             prompt_reps: Optional[List[dict]] = None,

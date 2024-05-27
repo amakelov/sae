@@ -10,24 +10,34 @@ from einops import rearrange
 from transformer_lens import utils
 
 
-from mandala._next.imports import op
+from mandala._next.imports import op, NewArgDefault
 from typing import Tuple
 
 from ioi_utils import *
 
 
 @op
-def normalize_activations(A: Tensor) -> Tuple[Tensor, float]:
+def normalize_activations(A: Tensor, scale: Optional[float] = NewArgDefault()) -> Tuple[Tensor, float]:
     """
     Normalize activations following
     https://transformer-circuits.pub/2024/april-update/index.html#training-saes:
     multiply by a scalar so that the average norm is sqrt(dimension)
     """
     assert len(A.shape) == 2
-    d_activation = A.shape[1]
-    avg_norm = A.norm(p=2, dim=1).mean()
-    normalization_scale = avg_norm / d_activation ** 0.5
-    return A / normalization_scale, normalization_scale
+    if isinstance(scale, NewArgDefault):
+        d_activation = A.shape[1]
+        avg_norm = A.norm(p=2, dim=1).mean()
+        normalization_scale = avg_norm / d_activation ** 0.5
+        return A / normalization_scale, normalization_scale
+    else:
+        return A / scale, scale
+
+@op
+def normalize_grad(A_grad: Tensor, scale: float) -> Tensor:
+    """
+    To be used w/ attribution SAEs
+    """
+    return A_grad / scale
 
 
 class VanillaAutoEncoder(nn.Module):
@@ -63,10 +73,6 @@ class VanillaAutoEncoder(nn.Module):
         l2_losses = (x_reconstruct.float() - A.float()).pow(2).sum(-1)
         l1_losses = acts.float().abs().sum(-1)
         return x_reconstruct, acts, l2_losses, l1_losses
-    
-    def get_reconstruction(self, A: Tensor) -> Tensor:
-        x_reconstruct, _, _, _ = self.forward_detailed(A)
-        return x_reconstruct
     
     def forward(self, A: Tensor):
         x_reconstruct, acts, l2_losses, l1_losses = self.forward_detailed(A)
@@ -177,7 +183,7 @@ class GatedAutoEncoder(nn.Module):
         return f_tilde
     
     @torch.no_grad()
-    def get_reconstructions(self, X: Tensor):
+    def get_reconstructions(self, X: Tensor) -> Tensor:
         f_tilde, pi_gate, _ = self.encode(X)
         X_hat, _, _ = self.decode(f_tilde, pi_gate, X)
         return X_hat
@@ -195,7 +201,7 @@ class AttributionAutoEncoder(VanillaAutoEncoder):
     """
     Following https://transformer-circuits.pub/2024/april-update/index.html#attr-dl
     """
-    def forward_detailed(self, A: Tensor, A_grad: Tensor):
+    def forward_detailed(self, A: Tensor, A_grad: Optional[Tensor] = None):
         A_centered = A - self.b_dec 
         acts = F.relu(A_centered @ self.W_enc + self.b_enc)
         A_hat = acts @ self.W_dec + self.b_dec
@@ -212,8 +218,12 @@ class AttributionAutoEncoder(VanillaAutoEncoder):
         # and b/c we don't want to compute all the gradients for reconstructions
         # we just use grad_x (metric), lol
 
-        attribution_sparsity_losses = (acts * (einsum('batch act_dim, hidden act_dim -> batch hidden', A_grad, self.W_dec))).abs().sum(-1)
-        unexplained_attribution_losses = einsum("batch act_dim, batch act_dim -> batch", A - A_hat, A_grad).abs()
+        if A_grad is not None:
+            attribution_sparsity_losses = (acts * (einsum('batch act_dim, hidden act_dim -> batch hidden', A_grad, self.W_dec))).abs().sum(-1)
+            unexplained_attribution_losses = einsum("batch act_dim, batch act_dim -> batch", A - A_hat, A_grad).abs()
+        else:
+            attribution_sparsity_losses = None
+            unexplained_attribution_losses = None
 
         return A_hat, acts, l2_losses, l1_losses, attribution_sparsity_losses, unexplained_attribution_losses
     
@@ -221,13 +231,17 @@ class AttributionAutoEncoder(VanillaAutoEncoder):
         x_reconstruct, _, _, _ = self.forward_detailed(A)
         return x_reconstruct
     
-    def forward(self, A: Tensor, A_grad: Tensor):
+    def forward(self, A: Tensor, A_grad: Optional[Tensor] = None):
         x_reconstruct, acts, l2_losses, l1_losses, attribution_sparsity_losses, unexplained_attribution_losses = self.forward_detailed(A, A_grad)
         
         l2_loss = l2_losses.mean()
         l1_loss = l1_losses.mean()
-        attribution_sparsity_loss = attribution_sparsity_losses.mean()
-        unexplained_attribution_loss = unexplained_attribution_losses.mean()
+        if A_grad is not None:
+            attribution_sparsity_loss = attribution_sparsity_losses.mean()
+            unexplained_attribution_loss = unexplained_attribution_losses.mean()
+        else:
+            attribution_sparsity_loss = None
+            unexplained_attribution_loss = None
         return x_reconstruct, acts, l2_loss, l1_loss, attribution_sparsity_loss, unexplained_attribution_loss
 
     @torch.no_grad()
@@ -243,17 +257,17 @@ class AttributionAutoEncoder(VanillaAutoEncoder):
     ### encapsulate some pieces of logic here w/ no_grad to avoid bugs
     @torch.no_grad()
     def get_activation_pattern(self, A: Tensor) -> Tensor:
-        _, acts, _, _ = self.forward_detailed(A)
+        _, acts, _, _, _, _ = self.forward_detailed(A)
         return (acts > 0).bool()
     
     @torch.no_grad()
     def get_feature_magnitudes(self, A: Tensor) -> Tensor:
-        _, acts, _, _ = self.forward_detailed(A)
+        _, acts, _, _, _, _ = self.forward_detailed(A)
         return acts
     
     @torch.no_grad()
     def get_reconstructions(self, A: Tensor) -> Tensor:
-        x_reconstruct, _, _, _ = self.forward_detailed(A)
+        x_reconstruct, _, _, _, _, _ = self.forward_detailed(A)
         return x_reconstruct
 
 

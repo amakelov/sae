@@ -118,13 +118,14 @@ def encoder_hook(activation: Tensor,
     """
     A = activation[idx]
     #! very important to normalize the activations before passing them to the encoder
-    reconstruction = encoder.get_reconstruction(A / encoder_normalization_scale) * encoder_normalization_scale
+    reconstruction = (encoder.get_reconstructions(A / encoder_normalization_scale) * encoder_normalization_scale).detach().clone()
     activation[idx] = reconstruction
     return activation
 
-@op
+@op(__allow_side_effects__=True) # we allow this here because nn.Modules have non-deterministic content hash :(
+@torch.no_grad()
 def get_logitdiff_loss(
-    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder], 
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder], 
     encoder_normalization_scale: float,
     node: Node,
     prompts: List[Prompt],
@@ -132,6 +133,11 @@ def get_logitdiff_loss(
     clean_ld: Optional[float] = None,
     mean_ablated_ld: Optional[float] = None,
     ) -> float:
+    """
+    DESPITE THE NAME, this actually computes something which is more like an
+    accuracy score. The closer this is to 1, the better the encoder is at
+    reconstructing the activations of the given node w.r.t. model predictions.
+    """
     mean_ablated_ld = mean_ablated_ld
     encoder_logits = run_with_hooks.f(
         prompts=prompts,
@@ -347,6 +353,19 @@ def reset_adam_optimizer_params(optimizer: torch.optim.Adam, param: torch.nn.Par
 ################################################################################
 ### Gated SAEs
 ################################################################################
+
+@op
+def get_gated(encoder_state_dict: Dict[str, Tensor], 
+             d_activation: int,
+             d_hidden: int,
+             ) -> GatedAutoEncoder:
+    """
+    Get a vanilla SAE with the given parameters
+    """
+    encoder = GatedAutoEncoder(d_activation=d_activation, d_hidden=d_hidden).cuda()
+    encoder.load_state_dict(encoder_state_dict, strict=True)
+    return encoder
+
 @op
 def train_gated(
     A: Tensor,
@@ -490,3 +509,188 @@ def resample_gated(encoder: GatedAutoEncoder, dead_indices: Tensor, A: Tensor, l
     reset_adam_optimizer_params(optimizer, encoder.W_gate, (slice(None), dead_indices))
     reset_adam_optimizer_params(optimizer, encoder.W_dec, (dead_indices, slice(None)))
     reset_adam_optimizer_params(optimizer, encoder.r_mag, dead_indices)
+
+
+
+
+
+################################################################################
+### attribution SAEs
+################################################################################
+@op
+def get_attribution(encoder_state_dict: Dict[str, Tensor], 
+                    d_activation: int,
+                    d_hidden: int,
+                    enc_dtype: str = "fp32",
+                    freeze_decoder: bool = False,
+                    ) -> AttributionAutoEncoder:
+    """
+    Get a vanilla SAE with the given parameters
+    """
+    encoder = AttributionAutoEncoder(d_activation=d_activation, d_hidden=d_hidden, enc_dtype=enc_dtype, freeze_decoder=freeze_decoder).cuda()
+    encoder.load_state_dict(encoder_state_dict, strict=True)
+    return encoder
+
+
+
+@op
+def train_attribution(
+    A: Tensor,
+    A_grad: Tensor,
+    d_hidden: int,
+    start_epoch: int,
+    end_epoch: int,
+    encoder_state_dict: Optional[Dict[str, Tensor]],
+    optimizer_state_dict: Optional[Any],
+    scheduler_state_dict: Optional[Any],
+    attribution_sparsity_penalty: float,
+    unexplained_attribution_penalty: float,
+    l1_coeff: float = DefaultConfig.L1_COEFF,
+    lr: float=DefaultConfig.LR,
+    beta1: float=DefaultConfig.BETA_1,
+    beta2: float=DefaultConfig.BETA_2,
+    weight_decay: float = DefaultConfig.WEIGHT_DECAY,
+    batch_size: int = DefaultConfig.BATCH_SIZE,
+    resample_epochs: Optional[List[int]] = None,
+    resample_warmup_steps: int = DefaultConfig.RESAMPLE_WARMUP_STEPS, 
+    torch_random_seed: int = 42,
+    freeze_decoder: bool = False,
+    final_decay_start: int = 1500,
+    final_decay_end: int = 2000,
+    enc_dtype: str = "fp32",
+    ) -> Tuple[Dict[str, Tensor], dict, dict, List[Dict[str, float]]]:
+    torch.manual_seed(torch_random_seed)
+    d_activation = A.shape[1]
+    if encoder_state_dict is None:
+        assert optimizer_state_dict is None and scheduler_state_dict is None
+    encoder = AttributionAutoEncoder(d_activation=d_activation, enc_dtype=enc_dtype,
+                            d_hidden=d_hidden, freeze_decoder=freeze_decoder).cuda()
+    if encoder_state_dict is not None:
+        encoder.load_state_dict(encoder_state_dict, strict=True)
+    optim = torch.optim.Adam(encoder.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=weight_decay)
+    if optimizer_state_dict is not None:
+        optim.load_state_dict(optimizer_state_dict)
+    scheduler = SAELRScheduler(optim, num_warmup_steps=resample_warmup_steps, 
+                              final_decay_start=final_decay_start, final_decay_end=final_decay_end)
+    if scheduler_state_dict is not None:
+        scheduler.load_state_dict(scheduler_state_dict)
+    pbar = tqdm(range(start_epoch, end_epoch))
+    n = A.shape[0]
+    metrics = []
+    for epoch in pbar:
+        perm = torch.randperm(n)
+        epoch_metrics = {
+            'epoch': epoch, # to keep track of the epoch
+            "l2_loss": 0,
+            "l1_loss": 0,
+            "l0_loss": 0,
+            "attribution_sparsity_loss": 0,
+            "unexplained_attribution_loss": 0,
+            "dead_mask": Tensor([True for _ in range(d_hidden)]).cuda().bool(), # dead neurons throughout the entire epoch
+        }
+        feature_counts = 0
+        for i in range(0, n, batch_size):
+            A_batch = A[perm[i:i+batch_size]]
+            A_grad_batch = A_grad[perm[i:i+batch_size]]
+            optim.zero_grad()
+            # A_hat, acts, l2_loss, l1_loss = encoder(A_batch)
+            # loss = l2_loss + l1_loss * l1_coeff
+            # loss.backward()
+            A_hat, acts, l2_loss, l1_loss, attribution_sparsity_loss, unexplained_attribution_loss = encoder.forward(A=A_batch, A_grad=A_grad_batch)
+            loss = l2_loss + l1_loss * l1_coeff + attribution_sparsity_loss * attribution_sparsity_penalty + unexplained_attribution_loss * unexplained_attribution_penalty
+            loss.backward()
+            optim.step()
+            encoder.make_decoder_weights_and_grad_unit_norm()
+            actual_batch_size = A_batch.shape[0]
+            epoch_metrics["l2_loss"] += l2_loss.item() * actual_batch_size
+            epoch_metrics["l1_loss"] += l1_loss.item() * actual_batch_size
+            epoch_metrics["l0_loss"] += (acts > 0).sum(dim=-1).float().mean().item() * actual_batch_size
+            epoch_metrics["attribution_sparsity_loss"] += attribution_sparsity_loss.item() * actual_batch_size
+            epoch_metrics["unexplained_attribution_loss"] += unexplained_attribution_loss.item() * actual_batch_size
+
+            feature_counts += (acts > 0).float().sum(dim=0)
+            dead_features_batch = (acts > 0).sum(dim=0) == 0
+            epoch_metrics["dead_mask"] = epoch_metrics["dead_mask"] & dead_features_batch # take AND w/ False to indicate alive neurons
+        scheduler.step()
+        epoch_metrics["l2_loss"] /= n
+        epoch_metrics["l1_loss"] /= n
+        epoch_metrics["l0_loss"] /= n
+        epoch_metrics["attribution_sparsity_loss"] /= n
+        epoch_metrics["unexplained_attribution_loss"] /= n
+        epoch_metrics['frac_dead'] = epoch_metrics["dead_mask"].float().mean().item()
+        num_alive = (1-epoch_metrics['frac_dead'])*d_hidden
+        del epoch_metrics["dead_mask"]
+        metrics.append(epoch_metrics)
+        if resample_epochs is not None and epoch in resample_epochs:
+            dead_indices = (feature_counts < 1).nonzero().squeeze()
+            # make sure dead_indices is not 0-dimensional
+            if len(dead_indices.shape) == 0:
+                dead_indices = dead_indices.unsqueeze(0)
+            if len(dead_indices) > 0:
+                resample_attribution(encoder=encoder, 
+                                        dead_indices=dead_indices, 
+                                        A=A, A_grad=A_grad,
+                                        l1_coeff=l1_coeff, 
+                                        attribution_sparsity_penalty=attribution_sparsity_penalty, 
+                                        unexplained_attribution_penalty=unexplained_attribution_penalty,
+                                        optimizer=optim)
+                scheduler.start_warmup()
+        pbar.set_description(f"l2_loss: {epoch_metrics['l2_loss']:.4f}, l1_loss: {epoch_metrics['l1_loss']:.4f}, " + 
+                             f"l0_loss: {epoch_metrics['l0_loss']:.4f}, frac_dead: {epoch_metrics['frac_dead']:.4f}, " +
+                             f"attribution_sparsity_loss: {epoch_metrics['attribution_sparsity_loss']:.4f}, " + 
+                             f"unexplained_attribution_loss: {epoch_metrics['unexplained_attribution_loss']:.4f}")
+    return encoder.state_dict(), optim.state_dict(), scheduler.state_dict(), metrics
+
+
+@torch.no_grad()
+def resample_attribution(encoder: VanillaAutoEncoder, dead_indices: Tensor, A: Tensor, 
+                         A_grad: Tensor,
+                         l1_coeff: float, attribution_sparsity_penalty: float, unexplained_attribution_penalty: float,
+                           optimizer: torch.optim.Adam, W_enc_reinit_scale: float = 0.2):
+    """
+    Re-initializes the weights of the encoder for the given indices, following
+    the re-initialization strategy from Anthropic
+    """
+    ### collect losses of the encoder on the activations
+    batch_size = 64
+    n = A.shape[0]
+    l2_parts, l1_parts = [], []
+    attribution_sparsity_parts, unexplained_attribution_parts = [], []
+    for i in range(0, n, batch_size):
+        A_batch = A[i:i+batch_size]
+        A_grad_batch = A_grad[i:i+batch_size]
+        _, _, l2_losses, l1_losses, attribution_sparsity_losses, unexplained_attribution_losses = encoder.forward_detailed(A_batch, A_grad_batch)
+        l2_parts.append(l2_losses)
+        l1_parts.append(l1_losses)
+        attribution_sparsity_parts.append(attribution_sparsity_losses)
+        unexplained_attribution_parts.append(unexplained_attribution_losses)
+    l2_losses = torch.cat(l2_parts)
+    l1_losses = torch.cat(l1_parts)
+    attribution_sparsity_losses = torch.cat(attribution_sparsity_parts)
+    unexplained_attribution_losses = torch.cat(unexplained_attribution_parts)
+    total_losses = l2_losses + l1_losses * l1_coeff + attribution_sparsity_losses * attribution_sparsity_penalty + unexplained_attribution_losses * unexplained_attribution_penalty
+    squared_losses = total_losses ** 2
+
+    ### sample indices of examples to use for re-initialization
+    sampling_probabilities = squared_losses / squared_losses.sum()
+    sample_indices = torch.multinomial(
+        sampling_probabilities,
+        len(dead_indices),
+        replacement=True, # in case there are more dead indices than examples
+    )
+
+    ### re-initialize decoder and encoder weights
+    encoder.W_dec.data[dead_indices, :] = A[sample_indices] / A[sample_indices].norm(dim=-1, keepdim=True)
+    encoder.W_enc.data[:, dead_indices] = encoder.W_dec.data[dead_indices, :].T.clone()
+    # now, figure out the average norm of W_enc over alive neurons
+    alive_indices = torch.ones(encoder.W_enc.shape[1], dtype=torch.bool)
+    alive_indices[dead_indices] = False
+    avg_alive_enc_norm = encoder.W_enc[:, alive_indices].norm(dim=-1).mean()
+    encoder.W_enc.data[:, dead_indices] *= W_enc_reinit_scale * avg_alive_enc_norm
+    encoder.b_enc.data[dead_indices] = 0.0
+
+    ### reset the optimizer weights for the changed parameters
+    # we must reset only the encoder bias, and the encoder and decoder weights
+    reset_adam_optimizer_params(optimizer, encoder.b_enc, dead_indices)
+    reset_adam_optimizer_params(optimizer, encoder.W_enc, (slice(None), dead_indices))
+    reset_adam_optimizer_params(optimizer, encoder.W_dec, (dead_indices, slice(None)))

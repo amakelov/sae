@@ -1,6 +1,6 @@
 from ioi_utils import *
-from circuit_utils import multidim_argmax, multidim_topk, get_feature_mask, get_feature_scores, get_prompt_representation, get_prompt_feature_idxs
-from sae_variants import VanillaAutoEncoder, GatedAutoEncoder
+from sae_variants import VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder
+from circuit_utils import FEATURE_SIZES
 
 ################################################################################
 ### some utils for faster interp computations
@@ -79,9 +79,9 @@ def multidim_topk(t: Tensor, k: int) -> Tuple[Tensor, ...]:
 ################################################################################
 ### main ops
 ################################################################################
-@op
+@op(__allow_side_effects__=True) # again, because of non-deterministic nn.Module hashes
 def get_high_f1_features(
-    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder],
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder],
     attributes: List[Tuple[str,...]],
     prompt_feature_idxs: Any,
     A_normalized: Tensor, # must be normalized for the encoder
@@ -95,7 +95,7 @@ def get_high_f1_features(
     - {attr: tensor of shape (*attr_shape, topk) of the top features (ordered)}
     - {attr: tensor of shape (*attr_shape, topk) of the top F1 scores (same order)}
     """
-    activation_pattern = encoder.get_activation_pattern(A=A_normalized)
+    activation_pattern = encoder.get_activation_pattern(A=A_normalized).float()
     masks = {attr: get_feature_mask(attr, prompt_feature_idxs=prompt_feature_idxs) for attr in attributes} # f -> (num_examples, *feature_shape)
     # attr -> (_, _, f1 scores) where f1 scores has shape (num_features, num_attr_values)
     f1_scores = {attr: get_feature_scores(activation_pattern, masks[attr])[2] for attr in attributes}
@@ -109,9 +109,9 @@ def get_high_f1_features(
     return features, f1_scores
 
 
-@op
+@op(__allow_side_effects__=True) # again, because of non-deterministic nn.Module hashes
 def autointerp_fast(
-    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder],
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder],
     features: List[Tuple[str,...]],
     prompt_feature_idxs: Any, 
     A_normalized: Tensor,
@@ -125,7 +125,7 @@ def autointerp_fast(
     - the best F1 score and corresponding index for each feature
     - the best F1 score and corresponding indices for each group of features
     """
-    activation_pattern = encoder.get_activation_pattern(A=A_normalized)
+    activation_pattern = encoder.get_activation_pattern(A=A_normalized).float()
     n_examples = A_normalized.shape[0]
     n_features = activation_pattern.shape[1]
     masks = {f: get_feature_mask(f, prompt_feature_idxs=prompt_feature_idxs) for f in features} # f -> (num_examples, *feature_shape)
