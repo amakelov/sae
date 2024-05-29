@@ -1,7 +1,7 @@
 from ioi_utils import *
-from circuit_utils import multidim_argmax, multidim_topk, get_feature_mask, get_feature_scores, get_prompt_representation, get_prompt_feature_idxs
-from sae_variants import VanillaAutoEncoder, GatedAutoEncoder
-from webtext_utils import *
+from circuit_utils import get_prompt_feature_idxs
+from sae_variants import VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder
+# from webtext_utils import *
 
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 
@@ -35,19 +35,19 @@ def mean_ablate_hook(activation: Tensor, hook: HookPoint, node: Node, mean: Tens
     activation[idx] = mean
     return activation
 
-def encoder_hook(activation: Tensor, hook: HookPoint, node: Node, encoder: AutoEncoder,
-                 idx: Tensor, normalization_scale: Optional[float] = None,
-                 ) -> Tensor:
-    with torch.no_grad():
-        if normalization_scale is not None:
-            A = activation[idx] / normalization_scale
-        else:
-            A = activation[idx]
-        reconstructions = encoder(A)[1]
-        if normalization_scale is not None:
-            reconstructions = reconstructions * normalization_scale
-        activation[idx] = reconstructions
-    return activation
+# def encoder_hook(activation: Tensor, hook: HookPoint, node: Node, encoder: Union[VanillaAutoEncoder, GatedAutoEncoder], normalization_scale: Optional[float] = None, idx: Tensor) -> Tensor:
+#                  idx: Tensor, normalization_scale: Optional[float] = None,
+#                  ) -> Tensor:
+#     with torch.no_grad():
+#         if normalization_scale is not None:
+#             A = activation[idx] / normalization_scale
+#         else:
+#             A = activation[idx]
+#         reconstructions = encoder(A)[1]
+#         if normalization_scale is not None:
+#             reconstructions = reconstructions * normalization_scale
+#         activation[idx] = reconstructions
+#     return activation
 
 
 ################################################################################
@@ -98,16 +98,44 @@ def compute_total_feature_weight(
     return selected_weights.sum(dim=1) # of shape (batch,)
 
 
-@op
+def get_top_k_features_per_prompt(
+        attr_idxs_clean: Tensor, # shape (batch,)
+        clean_active: Tensor, # boolean mask of shape (batch, n_features)
+        high_f1_features: Tensor, # index tensor, shape (attribute_size, n_features)
+        k: int,
+) -> Tensor:
+    n_examples = clean_active.shape[0]
+    # of shape (batch, n_features)
+    # provides the sorted indices of features, from highest to lowest F1, for the attribute
+    prompt_high_f1_features = high_f1_features[attr_idxs_clean]
+
+    # now, we permute the mask so that the entries are sorted according to the F1 score
+    batch_indices = torch.arange(n_examples).cuda().unsqueeze(1).expand_as(clean_active)
+    # now, we obtain a boolean mask where M[i, j] = True if the j-th highest F1 feature is active in the i-th prompt 
+    clean_active_in_decreasing_f1_order = clean_active[batch_indices, prompt_high_f1_features]
+
+    def get_indices_of_first_k_nonzeros(X: Tensor, k: int) -> Tensor:
+        idx = torch.arange(X.shape[1], 0, -1).cuda()
+        return torch.topk(X * idx, k=k, dim=1).indices
+
+    indices_of_top_features = get_indices_of_first_k_nonzeros(clean_active_in_decreasing_f1_order, k=k)
+    batch_indices = torch.arange(n_examples).cuda().unsqueeze(1).expand_as(indices_of_top_features)
+    top_k_features_per_prompt = prompt_high_f1_features[batch_indices, indices_of_top_features]
+    return top_k_features_per_prompt
+
+@op(__allow_side_effects__=True) 
 @batched(args=['A_clean', 'A_cf', 'clean_prompts', 'cf_prompts',], n_outputs=3, reducer='cat', verbose=False)
 def get_edit_using_f1_scores(
-    A_clean: Tensor,
-    A_cf: Tensor,
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder],
+    A_clean_normalized: Tensor,
+    A_cf_normalized: Tensor,
     clean_prompts: Any, 
     cf_prompts: Any,
+    clean_feature_idxs: Dict[Tuple[str,...], Tensor],
+    cf_feature_idxs: Dict[Tuple[str,...], Tensor],
     attribute: Tuple[str,...],
-    high_f1_features: Any, # of shape (*attribute_shape, topk)
-    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder],
+    high_f1_features_dict: Dict[Tuple[str,...], Tensor],
+    normalization_scale: float,
     num_exchange: int,
     batch_size: int = 100,
 ) -> Tuple[Tensor, Tensor, Tensor]:
@@ -126,19 +154,23 @@ def get_edit_using_f1_scores(
     - we now only change the top `num_exchange` features PRESENT in the activations.
     UPDATE in version 2:
     - fix bug when determining the top features!
-    """
-    n_examples = A_clean.shape[0]
-    magnitudes_clean = encoder.get_feature_magnitudes(A_clean)
-    magnitudes_cf = encoder.get_feature_magnitudes(A_cf)
 
-    clean_feature_idxs = get_prompt_feature_idxs(
-        prompts=clean_prompts,
-        features=[attribute],
-    )
-    cf_feature_idxs = get_prompt_feature_idxs(
-        prompts=cf_prompts, 
-        features=[attribute],
-    )
+    NOTE: this returns the *unnormalized* edited activations, in their original
+    scale.
+    """
+    high_f1_features = high_f1_features_dict[attribute]
+    n_examples = A_clean_normalized.shape[0]
+    magnitudes_clean = encoder.get_feature_magnitudes(A_clean_normalized)
+    magnitudes_cf = encoder.get_feature_magnitudes(A_cf_normalized)
+
+    # clean_feature_idxs = get_prompt_feature_idxs(
+    #     prompts=clean_prompts,
+    #     features=[attribute],
+    # )
+    # cf_feature_idxs = get_prompt_feature_idxs(
+    #     prompts=cf_prompts, 
+    #     features=[attribute],
+    # )
     # now, figure out which features to add/remove
     attr_idxs_clean = clean_feature_idxs[attribute].squeeze()
     attr_idxs_cf = cf_feature_idxs[attribute].squeeze()
@@ -156,20 +188,29 @@ def get_edit_using_f1_scores(
         return res
     clean_active = (magnitudes_clean > 0).bool()
     cf_active = (magnitudes_cf > 0).bool()
-    clean_active = pad_2d_boolean_mask(clean_active, num_exchange)
-    cf_active = pad_2d_boolean_mask(cf_active, num_exchange)
+    # unnecessary w/ new vectorized implementation
+    # clean_active = pad_2d_boolean_mask(clean_active, num_exchange)
+    # cf_active = pad_2d_boolean_mask(cf_active, num_exchange)
 
-    features_to_remove = []
-    for i in tqdm(range(n_examples)):
-        t = high_f1_features[attr_idxs_clean[i]]
-        features_to_remove.append(t[torch.isin(t, torch.where(clean_active[i])[0])][:num_exchange])
-    features_to_remove = torch.stack(features_to_remove, dim=0).long()
-    features_to_add = []
-    for i in tqdm(range(n_examples)):
-        t = high_f1_features[attr_idxs_cf[i]]
-        features_to_add.append(t[torch.isin(t, torch.where(cf_active[i])[0])][:num_exchange])
-    features_to_add = torch.stack(features_to_add, dim=0).long()
-    
+
+
+
+    ### slow way to get the features to add/remove
+    # features_to_remove = []
+    # for i in range(n_examples):
+    #     t = high_f1_features[attr_idxs_clean[i]]
+    #     features_to_remove.append(t[torch.isin(t, torch.where(clean_active[i])[0])][:num_exchange])
+    # features_to_remove = torch.stack(features_to_remove, dim=0).long()
+    # features_to_add = []
+    # for i in range(n_examples):
+    #     t = high_f1_features[attr_idxs_cf[i]]
+    #     features_to_add.append(t[torch.isin(t, torch.where(cf_active[i])[0])][:num_exchange])
+    # features_to_add = torch.stack(features_to_add, dim=0).long()
+
+    ### vectorized way to get the features to add/remove
+    features_to_remove = get_top_k_features_per_prompt(attr_idxs_clean, clean_active, high_f1_features, num_exchange)
+    features_to_add = get_top_k_features_per_prompt(attr_idxs_cf, cf_active, high_f1_features, num_exchange)
+
     ### now, perform the edits
     W_dec = encoder.W_dec.detach() # (hidden, dim)
 
@@ -184,17 +225,21 @@ def get_edit_using_f1_scores(
     to_remove = einsum("batch num_exchange, batch num_exchange dim -> batch dim", coeffs_to_remove, decoders_to_remove)
     to_add = einsum("batch num_exchange, batch num_exchange dim -> batch dim", coeffs_to_add, decoders_to_add)
 
-    A_edited = A_clean - to_remove + to_add
-    return A_edited, features_to_remove, features_to_add
+    A_edited_normalized = A_clean_normalized - to_remove + to_add
+    # A_edited of shape (batch, dim)
+    # features_to_remove: indices of the features to remove, of shape (batch, num_exchange)
+    # features_to_add: indices of the features to add, of shape (batch, num_exchange)
+    return A_edited_normalized * normalization_scale, features_to_remove, features_to_add
 
 
-@op
-@batched(args=['A_clean', 'A_cf'], n_outputs=5, reducer='cat', verbose=False)
+@op(__allow_side_effects__=True)
+@batched(args=['A_clean_normalized', 'A_cf_normalized'], n_outputs=5, reducer='cat', verbose=False)
 def get_edit_using_sae_opt(
-    A_clean: Tensor,
-    A_cf: Tensor,
-    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder],
+    A_clean_normalized: Tensor,
+    A_cf_normalized: Tensor,
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder],
     num_exchange: int,
+    normalization_scale: float,
     diff_to_use: Literal['reconstruction', 'activation'] = 'activation', # gives better results
     batch_size: int = 100,
     ) -> Tuple[Tensor, Any, Any, Tensor, Tensor]:
@@ -202,16 +247,16 @@ def get_edit_using_sae_opt(
     Greedily solve the optimization problem of subtracting/adding the fewest 
     features to minimize the norm. 
     """
-    n_examples = A_clean.shape[0]
-    recons_clean = encoder.get_reconstruction(A_clean)
-    recons_cf = encoder.get_reconstruction(A_cf)
-    magnitudes_clean = encoder.get_feature_magnitudes(A_clean)
-    magnitudes_cf = encoder.get_feature_magnitudes(A_cf)
+    n_examples = A_clean_normalized.shape[0]
+    recons_clean = encoder.get_reconstructions(A_clean_normalized)
+    recons_cf = encoder.get_reconstructions(A_cf_normalized)
+    magnitudes_clean = encoder.get_feature_magnitudes(A_clean_normalized)
+    magnitudes_cf = encoder.get_feature_magnitudes(A_cf_normalized)
 
     if diff_to_use == 'reconstruction':
         diff = recons_cf - recons_clean # shape (batch, dim)
     elif diff_to_use == 'activation':
-        diff = A_cf - A_clean
+        diff = A_cf_normalized - A_clean_normalized
     else:
         raise ValueError(f"Invalid value for `diff_to_use`: {diff_to_use}")
     
@@ -243,29 +288,29 @@ def get_edit_using_sae_opt(
         edited_cf = torch.stack([magnitudes_cf[range(n_examples), best_features[:, i]] for i in range(num_exchange)], dim=1)
         return best_features, best_scores, current_sums, edited_clean, edited_cf
     best_features, best_scores, deltas, edited_clean, edited_cf = optimize_vectorized(num_exchange)
-    A_edited = A_clean + deltas
-    return A_edited, best_features, best_scores, edited_clean, edited_cf
+    A_edited_normalized = A_clean_normalized + deltas
+    return A_edited_normalized * normalization_scale, best_features, best_scores, edited_clean, edited_cf
 
 
-@op
-def get_sae_reconstructions(
-    encoder: Union[AutoEncoder, SparseAutoencoder],
-    A: torch.Tensor,
-    normalization_scale: Optional[torch.Tensor],
-) -> Tensor:
-    is_webtext_sae = get_is_webtext_sae(encoder=encoder)
-    use_normalization = (normalization_scale is not None and (not is_webtext_sae))
-    if use_normalization:
-        A = A / normalization_scale
-    with torch.no_grad():
-        if is_webtext_sae:
-            encoder = encoder.to(A.device)
-            recons, _ = encoder(A)
-        else:
-            recons = encoder(A)[1]
-    if use_normalization:
-        recons = recons * normalization_scale
-    return recons
+# @op
+# def get_sae_reconstructions(
+#     encoder: Union[AutoEncoder, SparseAutoencoder],
+#     A: torch.Tensor,
+#     normalization_scale: Optional[torch.Tensor],
+# ) -> Tensor:
+#     is_webtext_sae = get_is_webtext_sae(encoder=encoder)
+#     use_normalization = (normalization_scale is not None and (not is_webtext_sae))
+#     if use_normalization:
+#         A = A / normalization_scale
+#     with torch.no_grad():
+#         if is_webtext_sae:
+#             encoder = encoder.to(A.device)
+#             recons, _ = encoder(A)
+#         else:
+#             recons = encoder(A)[1]
+#     if use_normalization:
+#         recons = recons * normalization_scale
+#     return recons
 
 from circuit_utils import get_forced_hook
 
@@ -353,80 +398,26 @@ def get_interp_approximation_intervention(
     return answer_logits
 
 
-### what
-@torch.no_grad()
-def get_freqs(encoder: AutoEncoder, A: Tensor, batch_size: Optional[int] = None) -> Tuple[Tensor, float]:
-    """
-    Get the feature frequencies for the given activations, and the fraction of
-    dead neurons.
-    """
-    act_freq_scores = torch.zeros(encoder.d_hidden, dtype=torch.float32).cuda()
-    total = 0
-    if batch_size is None:
-        num_batches = 1
-        batch_size = A.shape[0]
-    else:
-        num_batches = A.shape[0] // batch_size
-    with torch.no_grad():
-        for i in range(num_batches):
-            A_batch = A[i*batch_size:(i+1)*batch_size]
-            acts = encoder(A_batch)[2]
-            act_freq_scores += (acts > 0).sum(0)
-            total += acts.shape[0]
-    act_freq_scores /= total
-    frac_dead = (act_freq_scores==0).float().mean().item()
-    return act_freq_scores, frac_dead
-
-
-@torch.no_grad()
-def get_logitdiff_loss(
-    encoder: AutoEncoder, node: Node, prompts: List[Prompt], batch_size: int,
-    activation_mean: Tensor, normalization_scale: Optional[float] = None,
-    mean_clean_ld: Optional[float] = None, mean_ablated_ld: Optional[float] = None,
-    ) -> Tuple[float, float, float, float]:
-    """
-    The close this is to zero, the better the reconstruction.
-    """
-    if GlobalContext.current is not None:
-        c = GlobalContext.current
-    else:
-        c = Context()
-    with c(mode='noop'):
-        if mean_clean_ld is None:
-            clean_logits = run_with_hooks(
-                prompts=prompts,
-                hooks=[],
-                batch_size=batch_size,
-            )
-            clean_ld = (clean_logits[:, 0] - clean_logits[:, 1]).mean().item()
-        else:
-            clean_ld = mean_clean_ld
-        # zero_ablated_logits = run_with_hooks(
-        #     prompts=prompts,
-        #     hook_specs=[],
-        #     hooks=[(node.activation_name, partial(zero_ablate_hook, node=node))],
-        #     batch_size=batch_size,
-        # )
-        if mean_ablated_ld is None:
-            mean_ablated_logits = run_with_hooks(
-                prompts=prompts,
-                hooks=None,
-                semantic_nodes=[node],
-                semantic_hooks=[(node.activation_name, partial(mean_ablate_hook, node=node, mean=activation_mean))],
-                batch_size=batch_size,
-            )
-            mean_ablated_ld = (mean_ablated_logits[:, 0] - mean_ablated_logits[:, 1]).mean().item()
-        else:
-            mean_ablated_ld = mean_ablated_ld
-        encoder_logits = run_with_hooks(
-            prompts=prompts,
-            hooks=None,
-            semantic_nodes=[node],
-            semantic_hooks=[(node.activation_name, partial(encoder_hook, node=node, encoder=encoder, normalization_scale=normalization_scale))],
-            batch_size=batch_size,
-        )
-        encoder_ld = (encoder_logits[:, 0] - encoder_logits[:, 1]).mean().item()
-    # clean_ld = (clean_logits[:, 0] - clean_logits[:, 1]).mean()
-    # mean_ablated_ld = (mean_ablated_logits[:, 0] - mean_ablated_logits[:, 1]).mean()
-    score = (clean_ld - encoder_ld) / (clean_ld - mean_ablated_ld)
-    return score, clean_ld, mean_ablated_ld, encoder_ld
+# ### what
+# @torch.no_grad()
+# def get_freqs(encoder: AutoEncoder, A: Tensor, batch_size: Optional[int] = None) -> Tuple[Tensor, float]:
+#     """
+#     Get the feature frequencies for the given activations, and the fraction of
+#     dead neurons.
+#     """
+#     act_freq_scores = torch.zeros(encoder.d_hidden, dtype=torch.float32).cuda()
+#     total = 0
+#     if batch_size is None:
+#         num_batches = 1
+#         batch_size = A.shape[0]
+#     else:
+#         num_batches = A.shape[0] // batch_size
+#     with torch.no_grad():
+#         for i in range(num_batches):
+#             A_batch = A[i*batch_size:(i+1)*batch_size]
+#             acts = encoder(A_batch)[2]
+#             act_freq_scores += (acts > 0).sum(0)
+#             total += acts.shape[0]
+#     act_freq_scores /= total
+#     frac_dead = (act_freq_scores==0).float().mean().item()
+#     return act_freq_scores, frac_dead

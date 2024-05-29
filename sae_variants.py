@@ -168,8 +168,8 @@ class GatedAutoEncoder(nn.Module):
 
     ### encapsulate some pieces of logic here w/ no_grad to avoid bugs
     @torch.no_grad()
-    def get_activation_pattern(self, X: Tensor):
-        _, pi_gate, _ = self.encode(X)
+    def get_activation_pattern(self, A: Tensor):
+        _, pi_gate, _ = self.encode(A)
         return (pi_gate > 0).bool()
     
     @torch.no_grad()
@@ -227,9 +227,9 @@ class AttributionAutoEncoder(VanillaAutoEncoder):
 
         return A_hat, acts, l2_losses, l1_losses, attribution_sparsity_losses, unexplained_attribution_losses
     
-    def get_reconstruction(self, A: Tensor) -> Tensor:
-        x_reconstruct, _, _, _ = self.forward_detailed(A)
-        return x_reconstruct
+    # def get_reconstruction(self, A: Tensor) -> Tensor:
+    #     x_reconstruct, _, _, _ = self.forward_detailed(A)
+    #     return x_reconstruct
     
     def forward(self, A: Tensor, A_grad: Optional[Tensor] = None):
         x_reconstruct, acts, l2_losses, l1_losses, attribution_sparsity_losses, unexplained_attribution_losses = self.forward_detailed(A, A_grad)
