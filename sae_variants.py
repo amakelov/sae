@@ -10,7 +10,7 @@ from einops import rearrange
 from transformer_lens import utils
 
 
-from mandala._next.imports import op, NewArgDefault
+from mandala._next.imports import op, NewArgDefault, Storage
 from typing import Tuple
 
 from ioi_utils import *
@@ -335,7 +335,7 @@ def collect_gradients(
 
 
     individual_gradients = {}
-    for i in tqdm(range(len(prompt_dataset))): # iterate over the batch
+    for i in range(len(prompt_dataset)): # iterate over the batch
         # lol why isn't there (?) a way to get the batch of gradients in one go :(
         # Backward pass
         model.zero_grad() # make sure the model is zeroed out
@@ -368,3 +368,28 @@ def collect_gradients(
         nodes_result[node] = full_grad[node.idx(prompts=prompts)]
 
     return nodes_result
+
+def get_gradients(storage: Storage, nodes: List[Node], prompts: Any, computing: bool, n_batches: int) -> Dict[Node, Tensor]:
+    with storage:
+        prompts_raw = storage.unwrap(prompts)
+        n_total = len(prompts_raw)
+        grads_parts = []
+        result = {node: [] for node in nodes}
+
+        for i in tqdm(list(range(n_batches))):
+            # print(f'Batch {i}/{n_batches}')
+            start = i * (n_total // n_batches)
+            end = (i + 1) * (n_total // n_batches)
+            prompts = prompts_raw[start:end]
+            grads_part = collect_gradients(prompts=prompts, nodes=nodes, batch_size=20,)
+            if computing:
+                storage.commit()
+                storage.atoms.clear()
+            else:
+                grads_part = storage.unwrap(grads_part)
+                for node in nodes:
+                    result[node].append(grads_part[node])
+    if computing:
+        return None
+    else:
+        return {k: torch.cat(v, dim=0).cuda() for k, v in result.items()}

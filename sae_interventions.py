@@ -421,3 +421,64 @@ def get_interp_approximation_intervention(
 #     act_freq_scores /= total
 #     frac_dead = (act_freq_scores==0).float().mean().item()
 #     return act_freq_scores, frac_dead
+
+
+
+@op
+def get_activation_distance(
+    A_target: Tensor,
+    A_edited: Tensor,
+    A_target_grad: Optional[Tensor],
+    method: Literal['l2', 'attribution'],
+) -> float:
+    """
+    Compute a number measuring the distance between the target and edited
+    activations. Note that "distances" computed using different methods cannot
+    be compared meaningfully.
+    """
+    if method == 'l2':
+        return (A_target - A_edited).norm(dim=1).mean()
+    elif method == 'attribution':
+        return ((A_target-A_edited)*A_target_grad).abs().mean()
+    else:
+        raise ValueError()
+
+
+
+def get_feature_weights(
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder],
+    A_normalized: Tensor, 
+    batch_size: int,
+    ) -> Tuple[Tensor, Tensor]:
+    with torch.no_grad():
+        recons = encoder.get_reconstructions(A_normalized)
+        acts = encoder.get_feature_magnitudes(A_normalized)
+    num_examples = A_normalized.shape[0]
+    num_batches = num_examples // batch_size
+    feature_weights_batches = []
+    for i in tqdm(range(num_batches), disable=True):
+        acts_batch = acts[i*batch_size:(i+1)*batch_size]
+        centered_recons_batch = recons[i*batch_size:(i+1)*batch_size] - encoder.b_dec.detach().unsqueeze(0)
+        centered_recons_norms = centered_recons_batch.norm(dim=-1, keepdim=True)
+        feature_weights = einsum('batch hidden, hidden dim, batch dim -> batch hidden', acts_batch, encoder.W_dec.detach(), centered_recons_batch) / centered_recons_norms**2
+        feature_weights_batches.append(feature_weights)
+    feature_weights = torch.cat(feature_weights_batches, dim=0)
+    sums = feature_weights.sum(dim=1)
+    nonzero_sums = sums[sums != 0]
+    # set the nan values to 1 in `nonzero_sums`
+    nonzero_sums[torch.isnan(nonzero_sums)] = 1
+    ones = torch.ones_like(nonzero_sums)
+    sess.d()
+    assert torch.allclose(nonzero_sums, ones, atol=0.05), sums
+    return feature_weights, acts
+
+@op(__allow_side_effects__=True)
+def compute_removed_weight(
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder],
+    A_normalized: Tensor,
+    batch_size: int,
+    best_features: Tensor, 
+    ) -> Tensor:
+    weights, _ = get_feature_weights(encoder, A_normalized, batch_size,)
+    best_weights = torch.stack([weights[range(A_normalized.shape[0]), best_features[:, i]] for i in range(best_features.shape[1])], dim=1)
+    return best_weights.sum(dim=1)

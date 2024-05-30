@@ -486,6 +486,40 @@ def get_forced_hook(
         return activation
     return (node.activation_name, hook_fn)
 
+# @op
+# def run_activation_patch(
+#     base_prompts: Any, # List[Prompt],
+#     cf_prompts: Any, # List[Prompt],
+#     nodes: List[Node],
+#     activations: List[Tensor],
+#     batch_size: int,
+#     model_id: str = MODEL_ID,
+# ) -> Tuple[Tensor, Tensor]:
+#     """
+#     Run a standard activation patch in a batched way
+#     """
+#     model = get_model_obj(model_id)
+#     assert all([len(base_prompts) == v.shape[0] for v in activations])
+#     n = len(base_prompts)
+#     n_batches = (n + batch_size - 1) // batch_size
+#     base_logits_list = []
+#     cf_logits_list = []
+#     for i in tqdm(range(n_batches)):
+#         batch_indices = slice(i * batch_size, (i + 1) * batch_size)
+#         prompts_batch = base_prompts[batch_indices]
+#         cf_batch = cf_prompts[batch_indices]
+#         base_dataset = PromptDataset(prompts_batch, model=model)
+#         cf_dataset = PromptDataset(cf_batch, model=model)
+#         hooks = [get_forced_hook(prompts=prompts_batch, node=node, A=act[batch_indices]) for node, act in zip(nodes, activations)]
+#         changed_logits = model.run_with_hooks(base_dataset.tokens, fwd_hooks=hooks)[:, -1, :]
+#         base_answer_logits = changed_logits.gather(dim=-1, index=base_dataset.answer_tokens.cuda())
+#         cf_answer_logits = changed_logits.gather(dim=-1, index=cf_dataset.answer_tokens.cuda())
+#         base_logits_list.append(base_answer_logits)
+#         cf_logits_list.append(cf_answer_logits)
+#     base_logits = torch.cat(base_logits_list, dim=0)
+#     cf_logits = torch.cat(cf_logits_list, dim=0)
+#     return base_logits, cf_logits
+
 @op
 def run_activation_patch(
     base_prompts: Any, # List[Prompt],
@@ -494,6 +528,7 @@ def run_activation_patch(
     activations: List[Tensor],
     batch_size: int,
     model_id: str = MODEL_ID,
+    return_predictions: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """
     Run a standard activation patch in a batched way
@@ -504,6 +539,7 @@ def run_activation_patch(
     n_batches = (n + batch_size - 1) // batch_size
     base_logits_list = []
     cf_logits_list = []
+    predictions_list = []
     for i in tqdm(range(n_batches)):
         batch_indices = slice(i * batch_size, (i + 1) * batch_size)
         prompts_batch = base_prompts[batch_indices]
@@ -516,11 +552,15 @@ def run_activation_patch(
         cf_answer_logits = changed_logits.gather(dim=-1, index=cf_dataset.answer_tokens.cuda())
         base_logits_list.append(base_answer_logits)
         cf_logits_list.append(cf_answer_logits)
+        predictions = changed_logits.argmax(dim=-1)
+        predictions_list.append(predictions)
     base_logits = torch.cat(base_logits_list, dim=0)
     cf_logits = torch.cat(cf_logits_list, dim=0)
-    return base_logits, cf_logits
-
-
+    predictions = torch.cat(predictions_list, dim=0)
+    if return_predictions:
+        return base_logits, (cf_logits, predictions) #! lol, lmfaoooo
+    else:
+        return base_logits, cf_logits 
 ################################################################################
 ### simulated circuit
 ################################################################################

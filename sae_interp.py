@@ -195,4 +195,3 @@ def autointerp_fast(
         group_features = group_features_list[0]
         group_scores = group_scores_list[0]
     return top_features, top_scores, group_features, group_scores
-
