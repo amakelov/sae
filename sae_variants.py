@@ -393,3 +393,60 @@ def get_gradients(storage: Storage, nodes: List[Node], prompts: Any, computing: 
         return None
     else:
         return {k: torch.cat(v, dim=0).cuda() for k, v in result.items()}
+
+################################################################################
+### top-k SAEs
+################################################################################
+class TopKAutoEncoder(nn.Module):
+    def __init__(self, d_activation: int, d_hidden: int, k: int):
+        super().__init__()
+        self.d_activation = d_activation
+        self.d_hidden = d_hidden
+        self.k = k
+
+        self.W_enc = nn.Parameter(
+            torch.nn.init.kaiming_uniform_(
+                torch.empty(self.d_activation, self.d_hidden, ).cuda(),
+                nonlinearity="relu",
+            )
+        )
+        # Needs to be contiguous for the Triton kernel
+        self.W_dec = nn.Parameter(self.W_enc.data.mT.contiguous())
+
+        self.b_pre = nn.Parameter(torch.zeros(self.d_activation).cuda())
+    
+    def forward(self, A: Tensor):
+        acts = einsum('batch d_activation, d_activation d_hidden -> batch d_hidden', A - self.b_pre, self.W_enc)
+        top_acts, top_indices = acts.topk(self.k, dim=-1, 
+                                          sorted=False # we don't care about the order
+                                          )
+        # top_indices is (batch, k)
+        # we want to get a tensor of shape (batch, d_hidden) out of this
+        # by putting the top_k indices in the right places
+        # top_indices is (batch, k)
+        z = torch.zeros_like(acts)
+        z.scatter_(dim=-1, index=top_indices, src=top_acts)
+        A_reconstruct = z @ self.W_dec + self.b_pre
+        return A_reconstruct, acts, z
+    
+    @property
+    def b_dec(self): # a trick for compatibility with the other SAEs
+        return self.b_pre
+    
+    @torch.no_grad()
+    def get_activation_pattern(self, A: Tensor) -> Tensor:
+        _, acts, z = self.forward(A)
+        return (z != 0).bool()
+    
+    @torch.no_grad()
+    def get_feature_magnitudes(self, A: Tensor) -> Tensor:
+        _, _, z = self.forward(A)
+        return z
+    
+    @torch.no_grad()
+    def get_reconstructions(self, A: Tensor) -> Tensor:
+        A_reconstruct, _, _ = self.forward(A)
+        return A_reconstruct
+    
+
+

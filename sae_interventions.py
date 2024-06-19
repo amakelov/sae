@@ -1,6 +1,6 @@
 from ioi_utils import *
 from circuit_utils import get_prompt_feature_idxs
-from sae_variants import VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder
+from sae_variants import VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder, TopKAutoEncoder
 # from webtext_utils import *
 
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
@@ -126,7 +126,7 @@ def get_top_k_features_per_prompt(
 @op(__allow_side_effects__=True) 
 @batched(args=['A_clean', 'A_cf', 'clean_prompts', 'cf_prompts',], n_outputs=3, reducer='cat', verbose=False)
 def get_edit_using_f1_scores(
-    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder],
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder, TopKAutoEncoder],
     A_clean_normalized: Tensor,
     A_cf_normalized: Tensor,
     clean_prompts: Any, 
@@ -446,7 +446,7 @@ def get_activation_distance(
 
 
 def get_feature_weights(
-    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder],
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder, TopKAutoEncoder],
     A_normalized: Tensor, 
     batch_size: int,
     ) -> Tuple[Tensor, Tensor]:
@@ -473,7 +473,7 @@ def get_feature_weights(
 
 @op(__allow_side_effects__=True)
 def compute_removed_weight(
-    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder],
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder, TopKAutoEncoder],
     A_normalized: Tensor,
     batch_size: int,
     best_features: Tensor, 

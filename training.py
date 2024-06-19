@@ -125,7 +125,7 @@ def encoder_hook(activation: Tensor,
 @op(__allow_side_effects__=True) # we allow this here because nn.Modules have non-deterministic content hash :(
 @torch.no_grad()
 def get_logitdiff_loss(
-    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder], 
+    encoder: Union[VanillaAutoEncoder, GatedAutoEncoder, AttributionAutoEncoder, TopKAutoEncoder], 
     encoder_normalization_scale: float,
     node: Node,
     prompts: List[Prompt],
@@ -694,3 +694,89 @@ def resample_attribution(encoder: VanillaAutoEncoder, dead_indices: Tensor, A: T
     reset_adam_optimizer_params(optimizer, encoder.b_enc, dead_indices)
     reset_adam_optimizer_params(optimizer, encoder.W_enc, (slice(None), dead_indices))
     reset_adam_optimizer_params(optimizer, encoder.W_dec, (dead_indices, slice(None)))
+
+
+
+@op
+def get_topk(encoder_state_dict: Dict[str, Tensor], 
+             d_activation: int,
+             d_hidden: int,
+             k: int,
+             ) -> TopKAutoEncoder:
+    """
+    Get a vanilla SAE with the given parameters
+    """
+    encoder = TopKAutoEncoder(d_activation=d_activation, d_hidden=d_hidden, k=k).cuda()
+    encoder.load_state_dict(encoder_state_dict, strict=True)
+    return encoder
+
+
+@op
+def train_topk(
+    A: Tensor,
+    d_hidden: int,
+    start_epoch: int,
+    end_epoch: int,
+    encoder_state_dict: Optional[Dict[str, Tensor]],
+    optimizer_state_dict: Optional[Any],
+    scheduler_state_dict: Optional[Any],
+    k: int,
+    lr: float=DefaultConfig.LR,
+    beta1: float=DefaultConfig.BETA_1,
+    beta2: float=DefaultConfig.BETA_2,
+    weight_decay: float = DefaultConfig.WEIGHT_DECAY,
+    batch_size: int = DefaultConfig.BATCH_SIZE,
+    # resample_epochs: Optional[List[int]] = None,
+    # resample_warmup_steps: int = DefaultConfig.RESAMPLE_WARMUP_STEPS, 
+    torch_random_seed: int = 42,
+    final_decay_start: int = 1500,
+    final_decay_end: int = 2000,
+    ) -> Tuple[Dict[str, Tensor], dict, dict, List[Dict[str, float]]]:
+    torch.manual_seed(torch_random_seed)
+    d_activation = A.shape[1]
+    if encoder_state_dict is None:
+        assert optimizer_state_dict is None and scheduler_state_dict is None
+    encoder = TopKAutoEncoder(d_activation=d_activation, d_hidden=d_hidden, k=k).cuda()
+    if encoder_state_dict is not None:
+        encoder.load_state_dict(encoder_state_dict, strict=True)
+    optim = torch.optim.Adam(encoder.parameters(), lr=lr, betas=(beta1, beta2), weight_decay=weight_decay)
+    if optimizer_state_dict is not None:
+        optim.load_state_dict(optimizer_state_dict)
+    scheduler = SAELRScheduler(optim, num_warmup_steps=None, # not used b/c we never invoke warmup
+                              final_decay_start=final_decay_start, final_decay_end=final_decay_end)
+    if scheduler_state_dict is not None:
+        scheduler.load_state_dict(scheduler_state_dict)
+    pbar = tqdm(range(start_epoch, end_epoch))
+    n = A.shape[0]
+    metrics = []
+    for epoch in pbar:
+        perm = torch.randperm(n)
+        epoch_metrics = {
+            'epoch': epoch, # to keep track of the epoch
+            "l2_loss": 0,
+            "dead_mask": Tensor([True for _ in range(d_hidden)]).cuda().bool(), # dead neurons throughout the entire epoch
+        }
+        feature_counts = 0
+        for i in range(0, n, batch_size):
+            A_batch = A[perm[i:i+batch_size]]
+            optim.zero_grad()
+            A_hat, acts, z = encoder.forward(A_batch)
+            loss = (A_batch - A_hat).pow(2).sum(dim=-1).mean()
+            loss.backward()
+            optim.step()
+            actual_batch_size = A_batch.shape[0]
+            epoch_metrics["l2_loss"] += loss.item() * actual_batch_size
+            feature_counts += (acts > 0).float().sum(dim=0)
+            dead_features_batch = (acts > 0).sum(dim=0) == 0
+            epoch_metrics["dead_mask"] = epoch_metrics["dead_mask"] & dead_features_batch # take AND w/ False to indicate alive neurons
+        scheduler.step()
+        epoch_metrics["l2_loss"] /= n
+        epoch_metrics['frac_dead'] = epoch_metrics["dead_mask"].float().mean().item()
+        num_alive = (1-epoch_metrics['frac_dead'])*d_hidden
+        del epoch_metrics["dead_mask"]
+        metrics.append(epoch_metrics)
+
+        pbar.set_description(f"l2_loss: {epoch_metrics['l2_loss']:.4f}, " + 
+                             f"frac_dead: {epoch_metrics['frac_dead']:.4f}")
+    return encoder.state_dict(), optim.state_dict(), scheduler.state_dict(), metrics
+
