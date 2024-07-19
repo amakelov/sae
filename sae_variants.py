@@ -291,6 +291,8 @@ def collect_gradients(
     prompt_dataset = PromptDataset(prompts, model=model)
 
     layers_and_activations = list({(node.layer, node.component_name) for node in nodes})
+    activations = {}
+    grads = {}
 
     def get_forward_hook(location: Tuple[int, str]):
         def hook(model, input, output):
@@ -309,9 +311,6 @@ def collect_gradients(
         'k': 'hook_k',
         'v': 'hook_v',
     }
-
-    activations = {}
-    grads = {}
 
     forward_handles = {}
 
@@ -410,7 +409,6 @@ class TopKAutoEncoder(nn.Module):
                 nonlinearity="relu",
             )
         )
-        # Needs to be contiguous for the Triton kernel
         self.W_dec = nn.Parameter(self.W_enc.data.mT.contiguous())
 
         self.b_pre = nn.Parameter(torch.zeros(self.d_activation).cuda())

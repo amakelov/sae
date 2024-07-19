@@ -772,7 +772,6 @@ class batched:
             batch_size = kwargs.get("batch_size", None)
             verbose = kwargs.get("verbose", self.verbose)
             if batch_size is None:
-                sess.d()
                 return func(*args, **kwargs)
             bound_args = inspect.signature(func).bind(*args, **kwargs)
             bound_args.apply_defaults()
@@ -866,6 +865,7 @@ def run_with_cache(
     Run the model on the given prompts, and return the activations for the
     given nodes.
     """
+    print(f'Batch size: {batch_size}')
     model = MODELS[model_id]
     if len(prompts) % batch_size != 0:
         raise ValueError(f"Number of prompts ({len(prompts)}) must be a multiple of batch_size ({batch_size})")
